@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+results_*/
+results/
+
+# build artefacts of PyInstaller
+build/
+dist/
+*.spec.bak
+
+# the index the program keeps between runs
+cache*/

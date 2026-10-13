@@ -1,0 +1,71 @@
+"""Where the program really is — independent of what packed it into one exe.
+
+Two different packers are used on this program, and they disagree about what
+"the folder the program is in" means:
+
+* **PyInstaller** sets `sys.frozen` and points `sys.executable` at the real exe.
+* **Nuitka** sets neither. It points `sys.executable` at its OWN internal python,
+  inside a folder made for the run — which is not where the user put the program,
+  is a different name every time, and is gone when the program ends. The real
+  launcher is the thing the program was started as, and that is `sys.argv[0]`.
+
+Getting this wrong is not cosmetic. The results and the index are written into
+that folder, so on the wrong answer every search starts from nothing, the window
+cannot start a search at all, and ffmpeg placed beside the program goes unseen.
+Hence one place that answers it, used by all three.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Optional
+
+# Nuitka injects this name into the modules it compiles. Reading it by name is
+# the documented way; there is nothing to import and nothing to install.
+try:
+    _compiled = __compiled__                      # noqa: F821
+except NameError:                                 # not a Nuitka build
+    _compiled = None
+
+
+def is_packed() -> bool:
+    """Whether this program was packed into one launcher, rather than run from
+    sources. True under either packer."""
+    return getattr(sys, "frozen", False) or _compiled is not None
+
+
+def launcher_dir() -> Optional[str]:
+    """
+    The folder the launcher itself is in, or None when running from sources.
+
+    That is the folder the results and the index belong to, the folder a search
+    started from the window must be run in, and the folder to look for ffmpeg in.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    if _compiled is not None:
+        # the launcher is the program as it was started, not the python inside it
+        arg0 = getattr(_compiled, "original_argv0", None) or sys.argv[0]
+        return os.path.dirname(os.path.abspath(arg0))
+    return None
+
+
+def launcher_argv() -> list:
+    """
+    The command that runs this same program again — how the window starts a
+    search in a separate process.
+
+    Under either packer that is the launcher itself with new arguments, the same
+    way `SampleScanner.exe -q ... -s ...` runs the program instead of the window.
+    From sources it is the interpreter with the script, which is what has always
+    worked.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    if _compiled is not None:
+        return [sys.argv[0]]
+    # this module sits in ssc/, the entry point beside that folder
+    project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [sys.executable, "-u",
+            os.path.join(project, "samplescanner_gui.py")]
