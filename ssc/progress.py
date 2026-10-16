@@ -13,15 +13,18 @@ import time
 from typing import Optional, TextIO
 
 from ssc.format import fmt_elapsed
+from ssc.status import flash
 
 # How often the line may be redrawn on a terminal. Faster than this and the
 # characters only blur; slower and a fast job looks stuck.
 REFRESH = 1.0 / 12.0
 
 # How often a plain line is printed when the output is not a terminal — the
-# window of the gui, or a run piped into a file. Half a minute: a line per
-# percent of a large library would bury the report under thousands of them.
-INTERVAL = 30.0
+# window of the gui, or a run piped into a file. On a terminal this does not
+# apply at all: there the bar is redrawn in place (see REFRESH) and nothing is
+# left behind either way. Two seconds is short enough that a long job reads as
+# working rather than hung, and it is one line either way.
+INTERVAL = 2.0
 
 
 def _is_a_terminal(stream) -> bool:
@@ -48,13 +51,19 @@ class Progress:
 
     def __init__(self, total: int, text: str = "", width: int = 26,
                  stream: Optional[TextIO] = None,
-                 interval: float = INTERVAL, done: int = 0):
+                 interval: float = INTERVAL, done: int = 0,
+                 unit: str = "file"):
         self.total = max(0, int(total))
         self.text = text
         self.width = max(4, width)
         self.out = sys.stdout if stream is None else stream
         self.interval = interval
         self.done = max(0, int(done))
+        # what is being counted, so that the rate says it: the walk counts files
+        # of the collection, the precise pass counts the windows it reads out of
+        # them, and "12.4 file/s" over a row of windows would be a lie about
+        # what the bar is doing
+        self.unit = unit
         self._lock = threading.Lock()
         self._start = time.perf_counter()
         self._drawn_at = 0.0
@@ -72,13 +81,13 @@ class Progress:
             bar = f"[{'=' * filled}{'-' * (self.width - filled)}]"
             count = f"{done}/{total}  {done * 100 // total:3d}%"
         else:
-            bar, count = "", f"{done} file(s)"
+            bar, count = "", f"{done} {self.unit}(s)"
         # the same guess tqdm makes: what is done so far took this long, so
         # what is left of it will take about as much again. With nothing done
         # yet there is nothing to guess from, and the line says no ETA at all.
         left = (f"  ETA {fmt_elapsed(elapsed / done * (total - done))}"
                 if done and total and done < total else "")
-        rate = (f"  {done / elapsed:.1f} file/s"
+        rate = (f"  {done / elapsed:.1f} {self.unit}/s"
                 if done and elapsed > 0.3 else "")
         parts = [p for p in (self.text, bar, count,
                              fmt_elapsed(elapsed) + rate + left) if p]
@@ -100,12 +109,14 @@ class Progress:
         now = time.perf_counter()
         if not self._live:
             # nothing to overwrite: one line every few seconds is the progress
-            # report a pipe or a log file can carry
+            # report a pipe or a log file can carry. It is a status line, so a
+            # window reading the stream shows it under the output instead of
+            # filling the report with a line per interval.
             if not force and now - self._drawn_at < self.interval:
                 return
             self._drawn_at = now
             self._last_line = line
-            self._write(line + "\n")
+            flash(line)
             return
         if not force and now - self._drawn_at < REFRESH:
             return

@@ -24,8 +24,25 @@ def fmt_duration(seconds: float) -> str:
 
 def fmt_elapsed(seconds: float) -> str:
     """How long something took, the way a person says it out loud:
-    7s, 3m12s, 1h5m47s — no leading zeros, no colons to count."""
-    minutes, sec = divmod(int(seconds), 60)
+    7.4s, 33s, 24m3s, 1h5m47s - no leading zeros, no colons to count.
+
+    Below ten seconds the seconds are shown with a decimal, and below one
+    second with two, because that is where the whole range fits in the seconds
+    and where rounding to a whole one throws the answer away: building an
+    index of a small collection takes a hundredth of a second, building one of
+    a large collection takes minutes, and "0s" says that they are the same.
+
+    The whole seconds take over at 9.5 rather than at 10, so that the decimal
+    is never rounded to a value it is no longer followed by: 9.96 with one
+    decimal reads "10.0", and having it then go on to read "10s" would be the
+    same number written two ways. From a minute on it is the minutes that
+    matter anyway.
+    """
+    if seconds < 9.5:
+        return f"{seconds:.2f}s" if seconds < 1.0 else f"{seconds:.1f}s"
+    # rounded half up rather than cut off, or 9.5 would come out as 9s - a
+    # smaller number than the one before it, which is no way to write a clock
+    minutes, sec = divmod(int(seconds + 0.5), 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
         return f"{hours}h{minutes}m{sec}s"

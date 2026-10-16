@@ -64,6 +64,11 @@ class Report:
     # Empty unless more than one shift was tried.
     sweep_candidates: List[Tuple[Candidate, float]] = field(
         default_factory=list)
+    # the lines that named the fragments when they were written, so that a match
+    # found half way through a sweep can be named again in its verdict without
+    # saying that it had been written down before — the reader of a verdict
+    # should not have to have been watching the log. See print_saved.
+    exported_lines: List[str] = field(default_factory=list)
 
     @property
     def score(self) -> float:
@@ -83,14 +88,20 @@ def analyse_query(label: str, index: SearchIndex,
                   query_trim_tail: float = 0.0,
                   equiv_tol: float = EQUIV_TOL,
                   equiv_min_sim: float = EQUIV_MIN_SIM,
-                  equiv_gap: float = EQUIV_GAP) -> Report:
+                  equiv_gap: float = EQUIV_GAP,
+                  coarse_result: Optional[Tuple[List, List]] = None) -> Report:
     """
     Searches one query (already trimmed and pitch-shifted) and works out
     everything the report needs. Prints nothing — see print_report.
+
+    `coarse_result` is the shortlist of candidates, already computed together
+    with the other queries of the same walk over the index — see
+    coarse_search_many.
     """
     best, final, _per_file = find_match(
         index, qfeats, top_n=top_n,
-        duration=query_duration or duration, query_x=query_x)
+        duration=query_duration or duration, query_x=query_x,
+        coarse_result=coarse_result)
     margin_local, margin_file, equivalents = _margins(
         best, final, equiv_tol, equiv_min_sim, equiv_gap)
     # when a repeat was found there is no ambiguity inside the file — the
@@ -144,12 +155,18 @@ def analyse_query(label: str, index: SearchIndex,
 
 
 def print_report(rep: Report, index: SearchIndex, top_n: int = 5,
-                 verbose: bool = False) -> None:
-    """Prints what analyse_query worked out, exactly as it always was."""
+                 verbose: bool = False, with_query: bool = True) -> None:
+    """Prints what analyse_query worked out, exactly as it always was.
+
+    `with_query` is False when the caller has already named the query above
+    something of its own - the table of shifts, in a sweep - and does not want
+    the name twice.
+    """
     best = rep.best
     trim_shift = rep.trim_shift
     print()
-    print(f"QUERY  : {rep.label}")
+    if with_query:
+        print(f"QUERY  : {rep.label}")
     # NOT FOUND means nothing was found. Printing a source, a position, a
     # similarity and a margin for it would be describing a moment the program
     # itself says is not the sample — so the report is the verdict alone. What
@@ -264,7 +281,8 @@ def report(label: str, index: SearchIndex,
            equiv_tol: float = EQUIV_TOL,
            equiv_min_sim: float = EQUIV_MIN_SIM,
            equiv_gap: float = EQUIV_GAP,
-           pitch: float = 0.0, quiet: bool = False) -> Report:
+           pitch: float = 0.0, quiet: bool = False,
+           coarse_result: Optional[Tuple[List, List]] = None) -> Report:
     """Searches one query and prints the report unless quiet is set."""
     rep = analyse_query(
         label, index, qfeats, n_frames_query, duration, trim_shift, top_n,
@@ -273,7 +291,7 @@ def report(label: str, index: SearchIndex,
         query_duration=query_duration, kept_duration=kept_duration,
         query_x=query_x, query_trim_tail=query_trim_tail,
         equiv_tol=equiv_tol, equiv_min_sim=equiv_min_sim,
-        equiv_gap=equiv_gap)
+        equiv_gap=equiv_gap, coarse_result=coarse_result)
     if not quiet:
         print_report(rep, index, top_n, verbose)
     return rep

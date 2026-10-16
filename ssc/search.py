@@ -188,13 +188,15 @@ def _refine(qviews: Dict[Tuple[int, int, bool], np.ndarray],
 def find_match(index: SearchIndex,
                qfeats: Dict[Tuple[int, int], np.ndarray],
                top_n: int = 5, duration: float = 0.0,
-               query_x: Optional[np.ndarray] = None
+               query_x: Optional[np.ndarray] = None,
+               coarse_result: Optional[Tuple[List, List]] = None
                ) -> Tuple[Candidate, List[Candidate], Dict[str, np.ndarray]]:
     if index.coarse is not None:
         if query_x is None:
             raise RuntimeError("searching the on-disk index requires the raw "
                                "query signal")
-        return _find_match_disk(index, qfeats, top_n, duration, query_x)
+        return _find_match_disk(index, qfeats, top_n, duration, query_x,
+                                coarse_result)
     qviews = build_views(qfeats)
 
     final: List[Candidate] = []
@@ -225,17 +227,24 @@ def find_match(index: SearchIndex,
 
 def _find_match_disk(index: SearchIndex,
                      qfeats: Dict[Tuple[int, int], np.ndarray],
-                     top_n: int, duration: float, query_x: np.ndarray
+                     top_n: int, duration: float, query_x: np.ndarray,
+                     coarse_result: Optional[Tuple[List, List]] = None
                      ) -> Tuple[Candidate, List[Candidate], Dict[str, np.ndarray]]:
     """
     Search over the on-disk index: a coarse shortlist of candidates, then a
     precise check of each by re-reading a window from the original file. The
     result is converted to the same shape as the in-memory search so that the
     report, the verdict and repeat detection behave identically.
+
+    `coarse_result` is that shortlist, already computed: a sweep that answers
+    several queries in one walk over the index hands it in rather than have it
+    walked again. It is the same list the walk would have produced here.
     """
     duration = duration or max(
         (m.shape[0] for m in qfeats.values()), default=1) * HOP / SAMPLE_RATE
-    fine, _rough = coarse_search(index.coarse, query_x, qfeats, duration)
+    if coarse_result is None:
+        coarse_result = coarse_search(index.coarse, query_x, qfeats, duration)
+    fine, _rough = coarse_result
     if not fine:
         raise RuntimeError("The coarse search found no candidates — the query "
                            "is possibly too short.")

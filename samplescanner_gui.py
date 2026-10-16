@@ -26,6 +26,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if not getattr(sys, "frozen", False):
@@ -92,13 +93,16 @@ HINT_WRAP = 600
 # copy here: ssc.pitch is pure python (the resampling lives in ssc.audio), so
 # this costs nothing and the lines under the sliders cannot drift away from what
 # the search will really try.
+from ssc.config import DEFAULT_BATCH                                      # noqa: E402
 from ssc.format import exe_name, fmt_elapsed
 from ssc.launcher import launcher_argv, launcher_dir                 # noqa: E402
 from ssc.pitch import (count_pitches, describe_pitch_order,          # noqa: E402
                        describe_pitch_set)
+from ssc.status import is_status, plain
 from ssc.version import version_line
 
 MONO = "Consolas" if os.name == "nt" else "DejaVu Sans Mono"
+
 
 # The first word of the line the program prints when it wants an answer from
 # the window that started it. Must match CONFIRM_MARKER in samplescanner.py.
@@ -399,40 +403,27 @@ class RunWindow(tk.Toplevel):
         ttk.Label(self, textvariable=self.status, relief=tk.SUNKEN,
                   anchor=tk.W, padding=(6, 3)).pack(fill=tk.X, side=tk.BOTTOM)
 
-        # what the status line shows while the search runs: how long it has been
-        # going, and what it is doing now — a line that only ever says
-        # "starting…" tells a person nothing for the minutes a big collection
-        # takes, which is exactly when they want to know it is alive
-        self._phase = ""
+        # What the status line shows while the search runs: how long it has been
+        # going, and what it is doing now. The second part is NOT guessed here
+        # from the text of the report — the program says it, by sending a status
+        # line (ssc.status.flash), and all this window does is show whatever
+        # arrived last. A line that only ever says "starting…" tells a person
+        # nothing for the minutes a big collection takes, which is exactly when
+        # they want to know it is alive.
+        self._flash = ""
         self._lines = 0
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._start(argv, cwd)
         self.after(60, self._poll)
         self.after(1000, self._tick)
 
-    def _note_phase(self, line: str) -> None:
-        """Remembers what the program is doing, from the lines it prints."""
-        self._lines += 1
-        if line.startswith("Estimating size of index"):
-            self._phase = "estimating the index size"
-        elif line.startswith("building index ["):
-            nums = line.split("]", 1)[1].split()      # ['10/36', '27%', ...]
-            self._phase = ("building the index " + " ".join(nums[:2])
-                           if len(nums) >= 2 else "building the index")
-        elif line.startswith("INDEX "):
-            self._phase = "reading the queries"
-        elif line.startswith("QUERY :"):
-            self._phase = "searching " + os.path.basename(
-                line.split(":", 1)[1].strip())
-        elif line.lstrip().startswith("VERDICT"):
-            self._phase = "cutting the fragments"
-
     def _tick(self):
         if self.finished:
             return
         secs = fmt_elapsed(time.perf_counter() - self.t0)
+        what = self._flash
         self.status.set(f"running · {secs} · {self._lines} lines"
-                        + (f" · {self._phase}" if self._phase else ""))
+                        + (f" · {what}" if what else ""))
         self.after(1000, self._tick)
 
     # ---------- the process ----------
@@ -480,8 +471,14 @@ class RunWindow(tk.Toplevel):
             if line is None:
                 self._done()
                 return
+            if is_status(line):
+                # what the program is doing NOW: it goes to the status line and
+                # not into the report, where it would only be something to
+                # scroll past once the moment it describes is over
+                self._flash = plain(line)
+                continue
             self._put(line, self._tag_for(line))
-            self._note_phase(line)
+            self._lines += 1
             if line.startswith(CONFIRM_MARKER):
                 self._answer_confirmation(line)
             if line.startswith("RESULTS   :"):
@@ -536,7 +533,10 @@ class RunWindow(tk.Toplevel):
             return "weak"
         if line.startswith("Error:") or " ERROR " in line:
             return "bad"
-        if line.startswith(("QUERY :", "SOURCE  :", "INDEX", "Pitch", "=====",
+        # The name of the query in the REPORT is coloured; the one printed
+        # while the search is still running is not — that one is a step of a
+        # longer process, and colouring it the same would mark it as an answer.
+        if line.startswith(("QUERY  :", "SOURCE  :", "INDEX", "Pitch", "=====",
                             "Summary", "TOTAL")):
             return "head"
         return ""
@@ -599,6 +599,81 @@ class RunWindow(tk.Toplevel):
 # --------------------------------------------------------------------------- #
 # The search window: what to look for, where, and at which pitches
 # --------------------------------------------------------------------------- #
+
+
+class Tip:
+    """
+    The explanation of a control, shown while the pointer rests on it.
+
+    A window of its own, not text under the control: what these options have to
+    say is several lines long, and printed in the form it would take more room
+    than the control it belongs to. The pointer is over a small "?" next to it,
+    which is why the text is not in the form at all.
+
+    Several tips may be attached to the same control: they share one window and
+    only one of them is ever shown.
+    """
+    _live: Optional["Tip"] = None
+
+    def __init__(self, widgets: list, text: str) -> None:
+        self.text = text
+        self.win: Optional[tk.Toplevel] = None
+        for w in widgets:
+            w.bind("<Enter>", self._enter, add="+")
+            w.bind("<Leave>", self._leave, add="+")
+            w.bind("<ButtonPress>", self._leave, add="+")
+
+    def attach(self, *widgets) -> "Tip":
+        for w in widgets:
+            w.bind("<Enter>", self._enter, add="+")
+            w.bind("<Leave>", self._leave, add="+")
+            w.bind("<ButtonPress>", self._leave, add="+")
+        return self
+
+    def _enter(self, event) -> None:
+        # the pointer crossing from the control onto its own "?" must not close
+        # the window it just opened
+        if self.win is not None and self.win.winfo_exists():
+            return
+        Tip._live = self
+        x = event.widget.winfo_rootx() + 16
+        y = event.widget.winfo_rooty() + event.widget.winfo_height() + 6
+        self.win = tk.Toplevel()
+        self.win.wm_overrideredirect(True)
+        try:
+            self.win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        ttk.Label(self.win, text=self.text, justify=tk.LEFT, padding=8,
+                  wraplength=430, background="#fffbe8", foreground="#222",
+                  relief="solid", borderwidth=1).pack()
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        screen_w, screen_h = self.win.winfo_screenwidth(), \
+            self.win.winfo_screenheight()
+        x = min(x, max(8, screen_w - w - 12))
+        # below the control when there is room, above it when there is not
+        if y + h > screen_h - 12:
+            y = max(8, event.widget.winfo_rooty() - h - 6)
+        self.win.geometry(f"+{x}+{y}")
+
+    def _leave(self, _event) -> None:
+        if Tip._live is not self:
+            return
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        Tip._live = None
+
+
+def tip_mark(parent) -> ttk.Label:
+    """
+    The small "?" an explanation hangs on. It is created, not placed: a frame
+    inside another one is packed and a bare child is gridded, and the caller
+    knows which of the two it is dealing with.
+    """
+    return ttk.Label(parent, text=" ?", foreground="#06c", cursor="hand2",
+                     font=(None, 9, "bold"))
 
 
 class ScrollFrame(ttk.Frame):
@@ -860,17 +935,46 @@ class SearchDialog(tk.Toplevel):
         opts.pack(fill=tk.X, pady=(8, 0))
         self.nonlazy = tk.BooleanVar()
         self.noexport = tk.BooleanVar()
-        ttk.Checkbutton(opts, text="Non-lazy mode: try every pitch shift, even "
-                        "after a confident one",
-                        variable=self.nonlazy).grid(
-            row=0, column=0, sticky="w")
+        self.batch = tk.IntVar(value=DEFAULT_BATCH)
+
+        # How the library is walked is two decisions, and what each of them
+        # costs is more than fits here: both hang off the small "?" and come on
+        # hover - the control itself answers to the pointer as well.
+        batch_row = ttk.Frame(opts)
+        batch_row.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(batch_row, text="Batch size:").pack(side=tk.LEFT)
+        self.batch_spin = ttk.Spinbox(
+            batch_row, from_=1, to=99, width=5, textvariable=self.batch,
+            command=self._refresh_cmdline)
+        self.batch_spin.pack(side=tk.LEFT, padx=(4, 0))
+        mark = tip_mark(batch_row)
+        mark.pack(side=tk.LEFT, padx=(2, 0))
+        Tip([batch_row, self.batch_spin, mark],
+            "Process queries in batches. Runs faster in total, but intermediate "
+            "results report will be updated less often (you'll see results "
+            "for individual queries only after the whole batch is processed).")
+
+        lazy_row = ttk.Frame(opts)
+        lazy_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.lazymode = ttk.Checkbutton(
+            lazy_row,
+            text="Non-lazy mode: try every pitch shift, even after a "
+                 "confident one", variable=self.nonlazy)
+        self.lazymode.pack(side=tk.LEFT)
+        mark = tip_mark(lazy_row)
+        mark.pack(side=tk.LEFT, padx=(2, 0))
+        Tip([self.lazymode, lazy_row, mark],
+            "Processes more pitches but isn't actually that much slower "
+            "(could even be faster)")
         ttk.Checkbutton(opts, text="do not cut the fragments to files",
-                        variable=self.noexport).grid(row=0, column=1, sticky="w")
-        ttk.Label(opts, text="extra options:").grid(row=1, column=0, sticky="w",
+                        variable=self.noexport).grid(row=1, column=1,
+                                                      sticky="w", pady=(6, 0))
+        opts.columnconfigure(1, weight=1)
+
+        ttk.Label(opts, text="extra options:").grid(row=2, column=0, sticky="w",
                                                     pady=(6, 0))
         self.extra = ttk.Entry(opts, font=(MONO, 9))
-        self.extra.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(6, 0))
-        opts.columnconfigure(1, weight=1)
+        self.extra.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(6, 0))
 
         bottom = ttk.Frame(self, padding=(8, 8, 8, 8))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
@@ -930,10 +1034,10 @@ class SearchDialog(tk.Toplevel):
 
     def _update_pitch(self):
         lo, hi, step = self.pitch_range()
-        # the count belongs to this line: it is how many times every query is
-        # compared with the whole collection, and that is what decides the time
-        # a run takes — a person moves the handles and has to be able to see what
-        # the range now costs
+        # the count belongs to this line: it is how many query/shift pairs one
+        # run has to answer, and that is what decides the time a run takes - a
+        # person moves the handles and has to be able to see what the range now
+        # costs
         n = count_pitches(lo, hi, step)
         self.pitch_label.configure(
             text=f"pitches set: {describe_pitch_set(lo, hi, step)}"
@@ -962,6 +1066,7 @@ class SearchDialog(tk.Toplevel):
         argv.append(f"--pitchorder={self.order.get()}")
         if self.nonlazy.get():
             argv.append("--nonlazy")
+        argv.append(f"--batch={max(1, self.batch.get())}")
         if self.noexport.get():
             argv.append("--no-export")
         # the program must ask before it spends gigabytes on the disk, and the

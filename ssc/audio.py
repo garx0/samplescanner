@@ -6,10 +6,11 @@ import os
 import re
 import shutil
 import subprocess
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.signal import resample_poly
-from ssc.config import AUDIO_EXTENSIONS, EXTRACT_PAD, SAMPLE_RATE
+from ssc.config import (AUDIO_EXTENSIONS, BATCH_MAX_COMMAND, BATCH_WINDOWS,
+                        EXTRACT_PAD, SAMPLE_RATE)
 from ssc.format import exe_name
 from ssc.launcher import is_packed, launcher_dir
 from ssc.paths import is_dir, is_file, long_form
@@ -107,6 +108,108 @@ def load_audio(path: str, sr: int = SAMPLE_RATE, channels: int = 1,
     if channels > 1:
         x = x[: (len(x) // channels) * channels].reshape(-1, channels)
     return x
+
+
+def load_audio_many(windows: Sequence[Tuple[str, float, float]],
+                    sr: int = SAMPLE_RATE
+                    ) -> List[np.ndarray]:
+    """
+    Several windows through ONE ffmpeg, each decoded exactly as load_audio
+    would have decoded it on its own.
+
+    One candidate of the precise pass is one ffmpeg, and starting one costs far
+    more than decoding a few seconds of audio does: measured at 77 ms a
+    candidate, of which 57 ms was the process and 17 ms the feature bank. A
+    search reads up to 128 candidates per shift, so the starts alone cost more
+    than everything else the precise pass does.
+
+    Each window keeps its own input and its own -ss, so it is decoded from the
+    same place by the same decoder state as a read of its own - which is the
+    whole point. The other way round, one read covering a span and sliced in
+    memory, does NOT reproduce separate reads: ffmpeg's seek lands on its own
+    landing point and the resampler starts from there, and the two answers
+    differ measurably (up to completely unrelated audio for mp3).
+
+    Each branch is padded and then cut to an exact number of samples, and that
+    is what makes the segments land where they should: concat lays the stream
+    out by the length ffmpeg really produced, which is not always the length
+    asked for - one sample more often than not - so cutting is what keeps two
+    branches from being read one sample apart. Measured over the test
+    collections, what this returns is bit-identical to the individual reads.
+
+    `windows` is a list of (path, start, duration). Falls back to reading the
+    windows one by one whenever anything about the batched form is refused,
+    which is also what happens when a group holds a single window.
+    """
+    out: List[np.ndarray] = []
+    for group in _window_groups(windows):
+        out.extend(_read_group(group, sr) or
+                   [load_audio(p, sr=sr, start=s, duration=d)
+                    for p, s, d in group])
+    return out
+
+
+def _window_groups(windows: Sequence[Tuple[str, float, float]]
+                   ) -> List[List[Tuple[str, float, float]]]:
+    """
+    The windows split into groups ffmpeg can be asked for in one go: at most
+    BATCH_WINDOWS of them, and not so many that the command line comes near
+    what Windows will accept (a long collection path is repeated once per
+    input, and CreateProcess stops at 32767 characters).
+    """
+    groups: List[List[Tuple[str, float, float]]] = []
+    group: List[Tuple[str, float, float]] = []
+    size = 0
+    for w in windows:
+        need = len(w[0]) + 48
+        if group and (len(group) >= BATCH_WINDOWS or
+                      size + need > BATCH_MAX_COMMAND):
+            groups.append(group)
+            group, size = [], 0
+        group.append(w)
+        size += need
+    if group:
+        groups.append(group)
+    return groups
+
+
+def _read_group(group: Sequence[Tuple[str, float, float]],
+                sr: int) -> Optional[List[np.ndarray]]:
+    """
+    One ffmpeg for a group of windows, or None if it would not do it - in which
+    case the caller reads them one by one. Refusing is always possible and costs
+    only the time that was already going to be spent.
+    """
+    if len(group) < 2:
+        # a group of one is a read with a filter graph around it: all the ways
+        # to fail, and nothing to gain
+        return None
+    cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error"]
+    counts: List[int] = []
+    for path, start, duration in group:
+        cmd += ["-ss", f"{max(0.0, start):.6f}",
+                "-t", f"{max(0.0, duration):.6f}", "-i", path]
+        counts.append(int(round(max(0.0, duration) * sr)))
+    graph = []
+    for i, n in enumerate(counts):
+        graph.append(f"[{i}:a]aresample={sr},aformat=channel_layouts=mono,"
+                     f"apad,atrim=end_sample={n},"
+                     f"asetpts=PTS-STARTPTS[b{i}]")
+    graph.append("".join(f"[b{i}]" for i in range(len(group)))
+                 + f"concat=n={len(group)}:v=0:a=1[out]")
+    cmd += ["-filter_complex", ";".join(graph), "-map", "[out]",
+            "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(sr), "-"]
+    proc = run_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    flat = np.frombuffer(proc.stdout, dtype=np.float32)
+    if len(flat) < sum(counts):
+        return None
+    out, at = [], 0
+    for n in counts:
+        out.append(flat[at:at + n].copy())
+        at += n
+    return out
 
 
 def ffprobe_bin() -> str:

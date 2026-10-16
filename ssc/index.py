@@ -14,8 +14,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.signal import fftconvolve
 
-from ssc.audio import audio_duration, list_audio_files, load_audio
-from ssc.config import (BANK, COARSE_BANDS, COARSE_DTYPE, COARSE_HOP,
+from ssc.audio import (audio_duration, list_audio_files, load_audio,
+                       load_audio_many)
+from ssc.config import (BANK, BATCH_WINDOWS, COARSE_BANDS, COARSE_DTYPE,
+                        COARSE_HOP,
                         COARSE_MIN_FRAMES, COARSE_NFFT, COARSE_PER_MEMBER,
                         ENERGY_FLOOR, EPS, FINE_CANDIDATES, FINE_MAX_TOTAL,
                         FINE_MIN_SAMPLES, FINE_PAD, HOP,
@@ -452,16 +454,70 @@ def coarse_views(x: np.ndarray) -> Dict[bool, np.ndarray]:
     return {False: base, True: frame_center(time_delta(base))}
 
 
-def coarse_scan_file(entry: CoarseEntry, feats: np.ndarray, energy: np.ndarray,
-                     qviews: Dict[bool, np.ndarray]) -> np.ndarray:
+class CoarseSide:
     """
-    Coarse match profile over all offsets of one file.
-    Returns (n_coarse,) — a score in z-like units; -inf where the window is
+    The part of the coarse scan of one file that no query can change.
+
+    Everything in here comes from the stored features of the file alone: the
+    centred frames of each feature variant, the running sum of their squares
+    and the spread per band. A batch builds it once per file and then asks that
+    one file for a profile against every query and every pitch shift of the
+    batch, which is what lets the collection be walked once instead of once per
+    shift. What is NOT in here is the convolution - that one is a question of
+    the query, and it is the part that has to be done again for each of them.
+
+    The variants are built only when a query needs them: a file shorter than
+    the query has no use for the one it would be compared with.
+    """
+
+    __slots__ = ("n", "energy", "_views", "_energy_sum")
+
+    def __init__(self, n: int, energy: np.ndarray) -> None:
+        self.n = n
+        self.energy = energy
+        self._views: Dict[bool, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._energy_sum: Optional[Tuple[float, np.ndarray]] = None
+
+    def view(self, feats: np.ndarray, delta: bool
+             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(frames, running sum of their squares, spread per band), one variant.
+
+        The running sum is band major - (bands, frames+1), not (frames+1, bands)
+        - because everything that reads it takes one band at a time (see
+        _corr_profile), and a column of an (n, bands) array is touched again for
+        every band, which is the whole array each time over.
+        """
+        got = self._views.get(delta)
+        if got is None:
+            # same as in the main path: centre across frames (removes the level),
+            # then across bands along time - otherwise a spurious mean_Q * sum(R)
+            # term enters the covariance and pollutes the profile
+            R = frame_center(time_delta(feats) if delta else feats)
+            R = np.ascontiguousarray(R - R.mean(axis=0, keepdims=True),
+                                     dtype=np.float32)
+            cs = np.zeros((self.n + 1, R.shape[1]))
+            np.cumsum(R.astype(np.float64) ** 2, axis=0, out=cs[1:])
+            got = self._views[delta] = (R, np.ascontiguousarray(cs.T),
+                                        R.std(axis=0) + EPS)
+        return got
+
+    def energy_sum(self) -> Tuple[float, np.ndarray]:
+        """(median energy of the file, running sum of it) - read by every window."""
+        if self._energy_sum is None:
+            cs = np.concatenate(
+                [[0.0], np.cumsum(self.energy.astype(np.float64))])
+            self._energy_sum = (float(np.median(self.energy)) + EPS, cs)
+        return self._energy_sum
+
+
+def _scan_side(feats: np.ndarray, side: CoarseSide,
+               qviews: Dict[bool, np.ndarray]) -> np.ndarray:
+    """
+    Coarse match profile of one file against one query, over all offsets.
+    Returns (n,) - a score in z-like units; -inf where the window is
     too quiet.
     """
-    n = min(entry.n_coarse, feats.shape[0])
-    feats = np.ascontiguousarray(feats[:n], dtype=np.float32)
-    energy = energy[:n]
+    n = side.n
     acc = np.zeros(n)
     used = 0
     window = 1
@@ -470,13 +526,8 @@ def coarse_scan_file(entry: CoarseEntry, feats: np.ndarray, energy: np.ndarray,
         window = T
         if T > n:
             continue
-        # same as in the main path: centre across frames (removes the level),
-        # then across bands along time — otherwise a spurious mean_Q * sum(R)
-        # term enters the covariance and pollutes the profile
-        R = frame_center(time_delta(feats) if delta else feats)
-        R = np.ascontiguousarray(R - R.mean(axis=0, keepdims=True),
-                                 dtype=np.float32)
-        prof = _corr_profile(Q, R, R.std(axis=0) + EPS)
+        R, cs, std = side.view(feats, delta)
+        prof = _corr_profile(Q, R, cs, std)
         if prof is None:
             continue
         sd = prof.std()
@@ -487,12 +538,45 @@ def coarse_scan_file(entry: CoarseEntry, feats: np.ndarray, energy: np.ndarray,
     if used == 0:
         return np.full(n, -np.inf)
     acc /= used
-    return _apply_energy_gate(acc, energy, window)
+    return _apply_energy_gate(acc, side, window)
 
 
-def _corr_profile(Q: np.ndarray, R: np.ndarray,
+def coarse_scan_file(entry: CoarseEntry, feats: np.ndarray, energy: np.ndarray,
+                     qviews: Dict[bool, np.ndarray]) -> np.ndarray:
+    """
+    Coarse match profile over all offsets of one file.
+    Returns (n_coarse,) — a score in z-like units; -inf where the window is
+    too quiet.
+    """
+    n = min(entry.n_coarse, feats.shape[0])
+    side = CoarseSide(n, energy[:n])
+    return _scan_side(np.ascontiguousarray(feats[:n], dtype=np.float32),
+                      side, qviews)
+
+
+def _corr_profile(Q: np.ndarray, R: np.ndarray, cs: np.ndarray,
                   global_std: np.ndarray) -> Optional[np.ndarray]:
-    """Cosine profile of Q over all offsets of R (see profile_from_prepared)."""
+    """
+    Cosine profile of Q over all offsets of R (see profile_from_prepared).
+
+    Everything the score is made of - the RMS of the window, how far its bands
+    are from constant, the weighted correlation - is a quantity per offset AND
+    per band, and written out for all of it at once that is eight or nine
+    arrays of (n, bands) float64, four megabytes each. For a four-minute file
+    that is some sixty megabytes of traffic per query, and it was where the time
+    of a pass went: the convolution itself is a third of it.
+
+    So the bands are taken one at a time. The working set is then a handful of
+    n-element rows that stay in cache, and `cs` is stored band major so that a
+    band is a contiguous row rather than a column of the whole array.
+
+    The two sums over bands are still taken over a whole (n, bands) buffer,
+    because numpy adds along an axis pairwise and adding by hand would round
+    differently. Each band is the same operation in the same order on the same
+    numbers as before, so what comes out is the same number down to the last
+    bit - which is the whole requirement here: this may be quicker, never
+    different.
+    """
     T, B = Q.shape
     n = R.shape[0]
     if T == 0 or B == 0 or n < T:
@@ -505,31 +589,59 @@ def _corr_profile(Q: np.ndarray, R: np.ndarray,
     Rp = R
     if T > 1:
         Rp = np.vstack([R, np.zeros((T - 1, B), dtype=R.dtype)])
-    sq = Rp.astype(np.float64) ** 2
-    c2 = np.zeros((Rp.shape[0] + 1, B))
-    np.cumsum(sq, axis=0, out=c2[1:])
-    w_rms = np.sqrt(np.maximum((c2[T:T + n] - c2[:n]) / T, 0.0))
     cov = fftconvolve(Rp, Qc[::-1], mode="valid", axes=0)[:n]
-    denom = T * q_std[None, :] * w_rms
-    hi = np.maximum(q_std[None, :], w_rms)
-    informative = (np.minimum(q_std[None, :], w_rms) / (hi + EPS) > MIN_STD_RATIO) \
-        & (w_rms > MIN_STD_FLOOR * global_std[None, :])
-    corr = np.divide(cov, denom, out=np.zeros_like(cov, dtype=np.float64),
-                     where=informative & (denom > 1e-9))
-    np.clip(corr, -1.0, 1.0, out=corr)
-    corr *= informative
-    weight = np.where(informative, np.minimum(q_std[None, :], w_rms), 0.0)
-    wsum = weight.sum(axis=1)
-    return np.clip(np.divide((corr * weight).sum(axis=1), wsum,
+    covT = np.ascontiguousarray(cov.T)          # a band is then one row
+    # the two buffers the sums over bands are taken in, band major so that the
+    # rows are written in one go - filling a column of an (n, bands) array costs
+    # a cache line per offset, and that is as bad as the array it replaces.
+    # They are turned round once at the end, so that the sums are taken over
+    # the same layout as before.
+    prodT = np.empty((B, n), dtype=np.float64)
+    weightT = np.zeros((B, n), dtype=np.float64)
+    w = np.empty(n, dtype=np.float64)
+    lo = np.empty(n, dtype=np.float64)
+    hi = np.empty(n, dtype=np.float64)
+    denom = np.empty(n, dtype=np.float64)
+    corr = np.empty(n, dtype=np.float64)
+    ok = np.empty(n, dtype=bool)
+    head = n - T                              # offsets whose window fits wholly
+    for j in range(B):
+        qj = q_std[j]
+        # cs holds the running sum over R alone. Past its end the padded frames
+        # are zeros, and adding zeros never changes a sum - so reading cs there
+        # as its last value gives the number the padded running sum would hold.
+        run = cs[j]
+        np.subtract(run[T:n], run[:head], out=w[:head])
+        np.subtract(run[n], run[head:n], out=w[head:])
+        w /= T
+        np.maximum(w, 0.0, out=w)
+        np.sqrt(w, out=w)
+        # a band nearly constant on either side says nothing about the match
+        np.minimum(w, qj, out=lo)
+        np.maximum(w, qj, out=hi)
+        hi += EPS
+        np.divide(lo, hi, out=hi)
+        np.greater(hi, MIN_STD_RATIO, out=ok)
+        ok &= w > MIN_STD_FLOOR * global_std[j]
+        np.multiply(w, T * qj, out=denom)
+        corr.fill(0.0)
+        np.divide(covT[j], denom, out=corr, where=ok & (denom > 1e-9))
+        np.clip(corr, -1.0, 1.0, out=corr)
+        corr *= ok
+        np.copyto(weightT[j], lo, where=ok)
+        # corr is already zero where the band said nothing, so this is the same
+        # product as corr * weight without reading the weight back
+        np.multiply(corr, lo, out=prodT[j])
+    wsum = np.ascontiguousarray(weightT.T).sum(axis=1)
+    return np.clip(np.divide(np.ascontiguousarray(prodT.T).sum(axis=1), wsum,
                              out=np.zeros(n), where=wsum > EPS), -1.0, 1.0)
 
 
-def _apply_energy_gate(prof: np.ndarray, energy: np.ndarray,
+def _apply_energy_gate(prof: np.ndarray, side: CoarseSide,
                        window: int) -> np.ndarray:
-    med = float(np.median(energy)) + EPS
-    cs = np.concatenate([[0.0], np.cumsum(energy.astype(np.float64))])
-    idx = np.arange(len(energy))
-    end = np.minimum(idx + window, len(energy))
+    med, cs = side.energy_sum()
+    idx = np.arange(side.n)
+    end = np.minimum(idx + window, side.n)
     avg = (cs[end] - cs[idx]) / np.maximum(end - idx, 1)
     return np.where(avg >= ENERGY_FLOOR * med, prof, -np.inf)
 
@@ -552,18 +664,41 @@ def _coarse_peaks(prof: np.ndarray, count: int) -> List[int]:
     return picked
 
 
+def fine_window(entry: CoarseEntry, t_guess: float,
+                duration: float) -> Tuple[float, str, float]:
+    """
+    What one candidate has to be read: from where, how much, and of which file.
+
+    Split out of fine_verify because the reads of a whole batch now happen
+    together (load_audio_many) — this says what to ask for, that says when.
+    """
+    start = max(0.0, t_guess - FINE_PAD)
+    return start, entry.path, duration + 2 * FINE_PAD
+
+
 def fine_verify(entry: CoarseEntry, t_guess: float, duration: float,
                 qviews: Dict[Tuple[int, int, bool], np.ndarray]
                 ) -> Tuple[float, float, float]:
     """
-    Precise check of a candidate: re-read a window of a few seconds around
-    the guessed position from the original file and compute the full feature
-    bank. That way the final numbers are identical to what a search over a
-    fully computed collection would give.
+    Precise check of one candidate on its own: re-read a window of a few
+    seconds around the guessed position from the original file and compute the
+    full feature bank. That way the final numbers are identical to what a search
+    over a fully computed collection would give.
     """
-    start = max(0.0, t_guess - FINE_PAD)
-    x = load_audio(entry.path, sr=SAMPLE_RATE, start=start,
-                   duration=duration + 2 * FINE_PAD)
+    start, path, want = fine_window(entry, t_guess, duration)
+    return fine_check(load_audio(path, sr=SAMPLE_RATE, start=start,
+                                 duration=want), start, t_guess, duration,
+                      qviews)
+
+
+def fine_check(x: np.ndarray, start: float, t_guess: float, duration: float,
+               qviews: Dict[Tuple[int, int, bool], np.ndarray]
+               ) -> Tuple[float, float, float]:
+    """
+    Everything a candidate's numbers need except the reading of its window, so
+    that the same work is done whether the window came alone or with thirty
+    others out of one ffmpeg.
+    """
     # A candidate near the end of a file short enough to run out before the query
     # does has nothing to compare with: the window ffmpeg returned stops in the
     # middle of the query, similarity_at can only answer "not measurable", and
@@ -614,21 +749,141 @@ def coarse_search(index: CoarseIndex, query_x: np.ndarray,
                   duration: float, verbose: bool = False
                   ) -> Tuple[List[CoarseCandidate], List[CoarseCandidate]]:
     """
-    Two-pass search: the coarse pass over the on-disk index shortlists
-    candidates, the precise pass reads only those from the original files
-    and computes the full feature bank.
+    Two-pass search of one query: the coarse pass over the on-disk index
+    shortlists candidates, the precise pass reads only those from the original
+    files and computes the full feature bank.
     """
-    qviews_coarse = coarse_views(query_x)
-    qviews_full = build_views(qfeats)
-    rough: List[CoarseCandidate] = []
+    return coarse_search_many(index, [(query_x, qfeats, duration)])[0]
+
+
+def coarse_search_many(
+        index: CoarseIndex,
+        queries: Sequence[Tuple[np.ndarray, Dict[Tuple[int, int], np.ndarray],
+                                float]],
+        progress: Sequence = None,
+        verify=None,
+        walk_done=None) -> List[Tuple[List[CoarseCandidate],
+                                     List[CoarseCandidate]]]:
+    """
+    The same two-pass search for several queries at once - which is what a pitch
+    sweep is: every shift of a query is a query of its own - with ONE walk over
+    the collection instead of one per query.
+
+    Each query gets exactly the list of candidates, the shortlist and the
+    precise pass it would have got on its own: the score of a file against a
+    query at a shift depends on nothing outside those three, so how many of
+    them are answered in one walk cannot change it. What the walk saves is the
+    part of the work that belongs to the FILE - reading its features, centring
+    them, the running sum of their squares - which is the same for every query
+    of the batch and is done once per file.
+
+    `progress` is stepped once per file, so a caller can show how far the walk
+    has got; a walk over a large collection is minutes long and silence in the
+    middle of it reads as a hang. `verify` is called with the number of windows
+    the precise pass is going to read, and the bar it returns is stepped once
+    per window: the walk finishing is not the answer arriving, and without a
+    second bar the time in between looks like the program stopped. `walk_done`
+    is called at that same moment, so that the bar of the walk can be finished
+    there - left open it would measure its own line after the precise pass had
+    added its time and its rate to it, and say it had read the files slower than
+    it did.
+
+    Returns one (precise, rough) pair per query, in the order they came in.
+    """
+    qviews_coarse = [coarse_views(x) for x, _f, _d in queries]
+    qviews_full = [build_views(f) for _x, f, _d in queries]
+    # a query longer than a file cannot be compared with it at all; knowing the
+    # shortest query of the batch saves reading a file none of them fits in
+    shortest = [min(Q.shape[0] for Q in qc.values()) for qc in qviews_coarse]
+    rough: List[List[CoarseCandidate]] = [[] for _ in queries]
     for entry in index.entries:
+        if progress is not None:
+            progress.step()
+        if not any(s <= entry.n_coarse for s in shortest):
+            continue
         feats, energy = index.load_entry(entry)
-        prof = coarse_scan_file(entry, feats, energy, qviews_coarse)
-        for k in _coarse_peaks(prof, COARSE_PER_MEMBER):
-            rough.append(CoarseCandidate(
-                file_name=entry.name, time=k * COARSE_HOP / SAMPLE_RATE,
-                coarse_z=float(prof[k])))
-        del feats, energy, prof
+        n = min(entry.n_coarse, feats.shape[0])
+        side = CoarseSide(n, energy[:n])
+        feats = np.ascontiguousarray(feats[:n], dtype=np.float32)
+        for i, qc in enumerate(qviews_coarse):
+            if shortest[i] > n:
+                continue
+            prof = _scan_side(feats, side, qc)
+            for k in _coarse_peaks(prof, COARSE_PER_MEMBER):
+                rough[i].append(CoarseCandidate(
+                    file_name=entry.name, time=k * COARSE_HOP / SAMPLE_RATE,
+                    coarse_z=float(prof[k])))
+        del feats, energy, side
+    if walk_done is not None:
+        walk_done()
+    # the shortlists are drawn for the whole batch before the first window is
+    # read, so that the precise pass knows how many it is going to read: that
+    # number is what its bar counts, and guessing it would leave a bar that
+    # fills past the end
+    picked = [_shortlist(r) for r in rough]
+    bar = verify(sum(len(p) for p in picked)) if verify is not None else None
+    try:
+        fine: List[List[CoarseCandidate]] = [[] for _ in picked]
+        # The windows of every shortlisted candidate of the whole batch, read
+        # together: one ffmpeg for a group of them instead of one each, which is
+        # where most of the time of the precise pass went (see BATCH_WINDOWS).
+        # The candidates are walked in order and only one group's worth of audio
+        # is held at a time - a batch of 36 shifts has 4608 of them, and holding
+        # every window would cost a gigabyte.
+        plan = []
+        for i, (_x, _f, dur) in enumerate(queries):
+            for c in picked[i]:
+                entry = index.by_name(c.file_name)
+                start, path, want = fine_window(entry, c.time, dur)
+                # A window that runs past the end of its source is left out of
+                # the groups below and read on its own. How much audio there
+                # actually is decides what such a window looks like - the rest is
+                # silence - and a group read pads each window out to a length it
+                # can only guess, which would put a different amount of silence
+                # into it than a read of its own does. There are a handful of
+                # such candidates: they are the ones at the end of a file.
+                alone = start + want > entry.duration - 4.0 / SAMPLE_RATE
+                plan.append((i, c, dur, start, path, want, alone))
+
+        audio: List[Optional[np.ndarray]] = [None] * len(plan)
+        group: List[int] = []
+
+        def read_group(keys: List[int]) -> None:
+            got = load_audio_many([(plan[k][4], plan[k][3], plan[k][5])
+                                   for k in keys])
+            for k, x in zip(keys, got):
+                audio[k] = x
+
+        for at, item in enumerate(plan):
+            _i, _c, _d, start, path, want, alone = item
+            if alone:
+                audio[at] = load_audio(path, sr=SAMPLE_RATE, start=start,
+                                       duration=want)
+                continue
+            group.append(at)
+            if len(group) >= BATCH_WINDOWS:
+                read_group(group)
+                group = []
+        if group:
+            read_group(group)
+
+        for (i, c, dur, start, _path, _want, _alone), x in zip(plan, audio):
+            t, sim, support = fine_check(x, start, c.time, dur, qviews_full[i])
+            fine[i].append(CoarseCandidate(
+                file_name=c.file_name, time=c.time, coarse_z=c.coarse_z,
+                similarity=sim, frame_support=support, refined_time=t))
+            if bar is not None:
+                bar.step()
+        for f in fine:
+            f.sort(key=lambda c: -c.similarity)
+        return list(zip(fine, rough))
+    finally:
+        if bar is not None:
+            bar.close()
+
+
+def _shortlist(rough: List[CoarseCandidate]) -> List[CoarseCandidate]:
+    """What the coarse pass shortlists out of its own rough candidates."""
     rough.sort(key=lambda c: -c.coarse_z)
 
     # The coarse z of one file is NOT comparable with the z of another: it is a
@@ -659,16 +914,7 @@ def coarse_search(index: CoarseIndex, query_x: np.ndarray,
                 break
             if round_no < len(lst):
                 picked.append(lst[round_no])
-
-    fine: List[CoarseCandidate] = []
-    for c in picked:
-        entry = index.by_name(c.file_name)
-        t, sim, support = fine_verify(entry, c.time, duration, qviews_full)
-        fine.append(CoarseCandidate(
-            file_name=c.file_name, time=c.time, coarse_z=c.coarse_z,
-            similarity=sim, frame_support=support, refined_time=t))
-    fine.sort(key=lambda c: -c.similarity)
-    return fine, rough
+    return picked
 
 
 def build_index(folder: str, jobs: int = 0, verbose: bool = False,

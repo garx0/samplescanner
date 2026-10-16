@@ -186,7 +186,8 @@ def export_match(query_name: str, source_rel: str, source_path: str,
 
 def export_report(rep: Report, run_dir: str, unsure_dir: str,
                   export_enabled: bool, search_folder: str,
-                  unsure_min_sim: float) -> float:
+                  unsure_min_sim: float,
+                  dest_override: Optional[str] = None) -> float:
     """
     Writes the fragments of one report and prints what was written. Returns the
     time it took.
@@ -195,14 +196,18 @@ def export_report(rep: Report, run_dir: str, unsure_dir: str,
     enough one into its unsure/ subfolder — so every query ends up with a
     fragment to listen to. rep.hits holds every equivalent copy of the
     recording, all of them confirmed, so all of them are exported.
+
+    `dest_override` puts them in that folder instead, wherever they would
+    normally go: it is how a match found half way through a sweep is written
+    down before the sweep is over (see INTERMEDIATE_SUBDIR).
     """
     t_one = time.perf_counter()
     if not export_enabled:
         return 0.0
     if rep.exportable:
-        dest_dir, note = run_dir, ""
+        dest_dir, note = dest_override or run_dir, ""
     elif rep.best.similarity >= unsure_min_sim:
-        dest_dir = unsure_dir
+        dest_dir = dest_override or unsure_dir
         note = f"  [uncertain — {rep.export_reason}]"
     else:
         print(f"  FRAGMENT: not exported — {rep.export_reason} "
@@ -226,19 +231,42 @@ def export_report(rep: Report, run_dir: str, unsure_dir: str,
             print(f"  FRAGMENT: could not save {hit.file_name} ({exc})")
     if len(done) > 1:
         print(f"  FRAGMENT: {len(done)} equivalent sources exported:")
+    print_saved(rep, done, note)
+    return time.perf_counter() - t_one
+
+
+def print_saved(rep: Report, done: List[Tuple[List[str], Hit]],
+                note: str) -> None:
+    """
+    Names the fragments that were written, the corrected ones only.
+
+    A match found at a pitch shift is written twice - the one that sounds like
+    the query, and the source's own pitch in orig_pitch/ - and only the first
+    is named here: somebody checking whether the program found the right thing
+    wants to hear what it found, and the copy at the source's own pitch is a
+    by-product of that, not part of the answer. It is in the folder all the
+    same, to be found by anyone who wants it.
+
+    The lines are kept on the report as well, because a match found half way
+    through a sweep is written down then and named again in its verdict at the
+    end: the reader of a verdict should not have to have been watching the log.
+    """
     plain_is_shifted = abs(rep.pitch) > 1e-9
+    lines: List[str] = []
     for saved, hit in done:
         for i, path in enumerate(saved):
             if i == 0 and plain_is_shifted:
-                tag = f"  [the source's own pitch, in {ORIG_PITCH_SUBDIR}/]"
-            elif i == 0:
-                tag = ""
-            else:
+                continue
+            if plain_is_shifted:
                 tag = (f"  [corrected by {fmt_semitones(-rep.pitch)} st, "
                        f"sounds like the query]")
-            print(f"            {_shown_path(path)}{tag}"
-                  f"{note if hit is done[0][1] and i == 0 else ''}")
-    return time.perf_counter() - t_one
+            else:
+                tag = ""
+            lines.append(f"            {_shown_path(path)}{tag}"
+                         f"{note if hit is done[0][1] and i == 0 else ''}")
+    for line in lines:
+        print(line)
+    rep.exported_lines = lines
 
 
 def _shown_path(path: str) -> str:

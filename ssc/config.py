@@ -116,6 +116,16 @@ COARSE_PER_MEMBER = 6      # peaks taken from each coarse feature
 FINE_MAX_TOTAL = 128       # ceiling on the shortlist; every file gets one peak
                            # until the budget is used up, which is what keeps a
                            # true match from being out-zoned by other files
+# The precise pass reads one window per candidate, and starting ffmpeg for one
+# costs several times what decoding that window does (measured: 57 ms of the
+# 77 ms a candidate takes). So the windows of a whole batch go through one ffmpeg
+# each, every window keeping its own input and its own -ss - see
+# load_audio_many, which is where the rule that makes the result identical to
+# separate reads is explained and where the fallback lives.
+BATCH_WINDOWS = 32         # windows per ffmpeg; more is barely quicker and the
+                           # command line grows with every one of them
+BATCH_MAX_COMMAND = 8000   # characters of command line per ffmpeg, a collection
+                           # path being repeated once per input
 INDEX_VERSION = 1
 
 REF_TAIL_PAD = 512   # zero frames appended past the end (≈3 s at HOP=128)
@@ -142,10 +152,31 @@ INDEX_SIZE_WARN = 2 * 1024 ** 3
 # that did not reach the export threshold in its unsure/ subfolder.
 DEFAULT_RESULTS_PREFIX = "results"
 DEFAULT_UNSURE_SUBDIR = "unsure"
+# How many queries one pass over the collection answers. Making a file ready to
+# be compared with something costs the same whatever is compared with it, so
+# the more queries share the pass the less of that work there is per query.
+# Four is a compromise: the search gets quicker with every step, but the report
+# of a query is printed only when the last query of its batch is done, and that
+# wait grows with the batch.
+DEFAULT_BATCH = 4
+# The sweep goes through the collection in rounds: one walk gives every query
+# still in play its next shift, and the queries that come back confident leave.
+# A round that stops less than a 1/ROUND_STOP_SHARE of them is not worth its
+# own walk, because the next one will not stop many either - from there the
+# rest of the shifts is cheaper to answer in a single pass. Raise it to split
+# into fewer rounds, lower it to give up sooner.
+ROUND_STOP_SHARE = 4
 # Where the fragment goes when it was searched at a pitch shift: the copy in
 # the run folder is shifted back and sounds like the query, the copy that keeps
 # the source's own pitch goes here.
 ORIG_PITCH_SUBDIR = "orig_pitch"
+# Where a confident match is written the moment it is found, before the rest of
+# the sweep has run: a sweep of a large collection over many shifts is hours
+# long, and a result that is only written at the end is a result that stopping
+# halfway throws away. The layout below it is the one of a normal export - the
+# fragment corrected to the query in here, the source's own pitch in
+# orig_pitch/ - so the folder can be listened to exactly like the run folder.
+INTERMEDIATE_SUBDIR = "intermediate"
 LOG_PREFIX = "log"
 RESULTS_STAMP = "%Y%m%d-%H%M%S"
 # Below this similarity there is nothing worth listening to at all (false
