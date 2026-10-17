@@ -24,6 +24,11 @@ arguments it is the program itself:
 
     SampleScanner.exe
     SampleScanner.exe -q .\\query -s .\\search -v
+
+and one argument makes it the index converter instead, which is how the window
+offers to convert indexes left over from an older version:
+
+    SampleScanner.exe --convert-caches
 """
 import os
 import shutil
@@ -58,10 +63,12 @@ for _name in ("cache", "results"):
 # Help button falls back to looking for it next to the exe.
 datas = []
 
-# The entry point hands over to samplescanner.main(), and the search itself runs
-# in the ssc package — named here as well, so that a refactoring of those lines
+# The entry point hands over to samplescanner.main(), the conversion over to
+# convert_caches_1to2.main() (reached by the --convert-caches argument, so that
+# one exe is still the whole program), and the search itself runs in the ssc
+# package — all of them named here as well, so that a refactoring of those lines
 # cannot quietly leave a module out of the build.
-hiddenimports = ["samplescanner", "ssc"]
+hiddenimports = ["samplescanner", "convert_caches_1to2", "ssc"]
 
 # Nothing of these is used, and every one of them is big. Only the obviously
 # unrelated ones may go in: scipy probes numpy.testing, numpy.f2py and unittest

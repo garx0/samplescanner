@@ -69,3 +69,28 @@ def launcher_argv() -> list:
     project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return [sys.executable, "-u",
             os.path.join(project, "samplescanner_gui.py")]
+
+
+# The argument that makes the frozen launcher be the converter instead of the
+# window or the search. One exe is three programs, told apart by what they are
+# asked to do — the same arrangement the search itself already uses.
+CONVERT_FLAG = "--convert-caches"
+
+
+def converter_argv() -> list:
+    """
+    The command that converts the old indexes.
+
+    A program of its own, not a mode of the search: it is a one-off maintenance
+    job that has to keep working long after the format it reads is gone. Packed
+    into one launcher it is the launcher with the flag that says so; from sources
+    it is the interpreter with convert_caches_1to2.py, which is that program's own
+    entry point and calls the very same main().
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, CONVERT_FLAG]
+    if _compiled is not None:
+        return [sys.argv[0], CONVERT_FLAG]
+    project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [sys.executable, "-u",
+            os.path.join(project, "convert_caches_1to2.py")]

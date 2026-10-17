@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from ssc.audio import _is_audio, list_audio_files
 from ssc.config import AUDIO_EXTENSIONS
 from ssc.format import safe_stem
@@ -82,37 +82,128 @@ def _against(list_path: str, entries: List[str]) -> List[str]:
     return out
 
 
-def _expand_source_entry(entry: str, recursive: bool,
-                         found: List[str], missing: List[str]) -> None:
-    """Turns one entry of -s into concrete audio files, appended to `found`."""
+def _expand_source_entry(entry: str, recursive: bool
+                         ) -> Tuple[List[str], List[Tuple[str, List[str]]]]:
+    """
+    Turns one entry of -s into concrete audio files, plus the record each of
+    them was picked through.
+
+    A record is what one entry stands for: a folder, one named file, or the
+    whole set of hits of one pattern. Its Z is the folder that record stands
+    for - the folder itself, the folder holding the named file, or, for a
+    pattern, the deepest folder holding every hit. The cache groups by that, so
+    the shape of what the user typed decides the shape of the cache and not the
+    other way round.
+    """
     path = os.path.expanduser(entry)
-    if _is_pattern(path):
-        hits = sorted(glob.glob(path, recursive=recursive))
-        if not hits:
-            missing.append(entry)
-            return
-        entries = hits
-    else:
-        entries = [path]
+    entries = (sorted(glob.glob(path, recursive=recursive))
+               if _is_pattern(path) else [path])
+
+    anchors: List[str] = []
+    records: List[Tuple[str, List[str]]] = []
+    files: List[str] = []
     for p in entries:
         p = os.path.expandvars(p)
         if _is_dir(p):
+            here: List[str] = []
             # os.walk needs the prefixed form too, or it returns nothing at all
-            # for a long path and the collection looks empty — and what it hands
+            # for a long path and the collection looks empty - and what it hands
             # back has the prefix stripped again, so no name that reaches the
             # index or the report is spelled in a way nobody typed
-            for root, dirs, files in os.walk(_long_form(p)):
+            for root, dirs, fs in os.walk(_long_form(p)):
                 dirs.sort()
-                for n in sorted(files):
+                for n in sorted(fs):
                     if _is_audio(n):
-                        found.append(plain(os.path.join(root, n)))
-        elif _is_file(p):
-            if _is_audio(p):
-                found.append(p)
+                        here.append(plain(os.path.join(root, n)))
+            if here:
+                here.sort()
+                anchors.append(os.path.abspath(p))
+                records.append((os.path.abspath(p), here))
+                files.extend(here)
+        elif _is_file(p) and _is_audio(p):
+            full = os.path.abspath(p)
+            z = os.path.dirname(full) or full
+            anchors.append(z)
+            records.append((z, [p]))
+            files.append(p)
+
+    if not records:
+        return [], []
+    if _is_pattern(path) and len(records) > 1:
+        # one pattern is one record: it stands for the deepest folder holding
+        # every hit, so that a pattern over a whole library does not scatter the
+        # cache across whatever folders the wildcard happened to reach
+        merged: List[str] = []
+        for _z, here in records:
+            merged.extend(here)
+        merged.sort()
+        records = [(_common_folder(anchors), merged)]
+    return files, records
+
+
+def _common_folder(folders: List[str]) -> str:
+    """The deepest folder that contains all of them."""
+    if len(folders) == 1:
+        return folders[0]
+    try:
+        common = os.path.commonpath(folders)
+    except ValueError:             # not one root: nothing deeper than the first
+        return folders[0]
+    if not _is_dir(common):        # a single file: commonpath returns the file
+        common = os.path.dirname(common) or common
+    return common
+
+
+def _drive_top(file_path: str) -> str:
+    """The folder in the root of the drive that holds this file."""
+    drive, rest = os.path.splitdrive(file_path)
+    parts = [q for q in rest.split(os.sep) if q]
+    return os.path.join(drive + os.sep, parts[0]) if parts else file_path
+
+
+def _is_root(path: str) -> bool:
+    path = os.path.abspath(path)
+    return os.path.dirname(path) == path
+
+
+def _depth(path: str) -> int:
+    """How deep a folder sits, counted as address components."""
+    return len([q for q in os.path.abspath(path).rstrip("\\/").split(os.sep) if q])
+
+
+def top_folders(records: List[Tuple[str, List[str]]]) -> Dict[str, str]:
+    """
+    Which library folder X each file belongs to.
+
+    X is the folder of the record, which is what the user named and therefore
+    what they will recognise later. The exception is a drive: picking one means
+    every folder on it, and there is no single folder to name, so each file goes
+    under the top folder of its own drive instead.
+
+    A file that several records cover belongs to the deepest of them - the most
+    specific choice - and, at equal depth, to the first by name. Settling it
+    here rather than in the cache is what makes the layout independent of the
+    order the entries were given in.
+
+    The keys are case-folded, because that is the form the cache looks files up
+    in, and a path spelled with a different case still has to find its folder.
+    """
+    best: Dict[str, Tuple[int, str, str]] = {}     # file -> (-depth, X, X)
+    for z, files in records:
+        z = os.path.abspath(z)
+        for p in files:
+            full = os.path.abspath(p)
+            if not _is_root(z):
+                x = z
+            elif os.path.dirname(full) == z:
+                x = z                    # the file sits in the drive root itself
             else:
-                missing.append(p)
-        else:
-            missing.append(p)
+                x = _drive_top(full)
+            k = os.path.normcase(os.path.abspath(p))
+            cand = (-_depth(x), x, x)
+            if k not in best or cand < best[k]:
+                best[k] = cand
+    return {k: v[2] for k, v in best.items()}
 
 
 def _as_specs(specs) -> List[str]:
@@ -177,12 +268,19 @@ def _specs_label(specs: List[str], fallback: str) -> str:
 
 def resolve_sources(specs, recursive: bool = True
                     ) -> Tuple[str, List[str], str]:
+    base, names, _records, label = resolve_source_records(specs, recursive)
+    return base, names, label
+
+
+def resolve_source_records(specs, recursive: bool = True
+                           ) -> Tuple[str, List[str],
+                                      List[Tuple[str, List[str]]], str]:
     """
-    Turns -s into (base folder, file names relative to it, label).
+    Turns -s into (base folder, file names relative to it, records, label).
 
     Every argument may be a folder (what it always was), a glob pattern of
     folders and/or files, or a text file of any extension that lists folders,
-    files and glob patterns, one per line — and there may be several arguments
+    files and glob patterns, one per line - and there may be several arguments
     at once, which is what a file browser hands over when several items are
     picked at the same time:
 
@@ -193,9 +291,14 @@ def resolve_sources(specs, recursive: bool = True
 
     All the entries end up under ONE base folder: the deepest directory that
     contains every file found. Names stay relative to it, which is what the
-    index and the whole program work with. When the files sit on different
-    drives there is no such folder and the names are the full paths instead —
-    os.path.join("", name) still opens them.
+    report works with. When the files sit on different drives there is no such
+    folder and the names are the full paths instead - os.path.join("", name)
+    still opens them.
+
+    The records say which folder each file was picked through. The search itself
+    has no use for them; the index needs them to lay the cache out, because
+    which folder the user named is the only thing that can say which cache
+    folder a file belongs to when two of them could take it.
     """
     specs = _as_specs(specs)
     entries: List[str] = []
@@ -209,14 +312,17 @@ def resolve_sources(specs, recursive: bool = True
             more = read_source_list(path)    # a text file with a list
             if not more:
                 raise FileNotFoundError(
-                    f"{spec} is empty — nothing to search.")
+                    f"{spec} is empty - nothing to search.")
             entries.extend(_against(path, more))
         else:
             entries.append(spec)
 
     abs_paths: List[str] = []
+    records: List[Tuple[str, List[str]]] = []
     for e in entries:
-        _expand_source_entry(e, recursive, abs_paths, [])
+        found, recs = _expand_source_entry(e, recursive)
+        abs_paths.extend(found)
+        records.extend(recs)
     # de-duplicate, keeping the order stable
     seen = set()
     uniq = []
@@ -227,7 +333,7 @@ def resolve_sources(specs, recursive: bool = True
             uniq.append(p)
     if not uniq:
         raise FileNotFoundError(
-            f"No audio files matched {' '.join(repr(s) for s in specs)} — "
+            f"No audio files matched {' '.join(repr(s) for s in specs)} - "
             f"check the paths, the glob or the list file.")
 
     full = [os.path.abspath(p) for p in uniq]
@@ -245,7 +351,7 @@ def resolve_sources(specs, recursive: bool = True
     pairs = sorted(zip(names, full), key=lambda t: t[0].lower())
     names = [n for n, _ in pairs]
 
-    return base, names, _specs_label(specs, "search")
+    return base, names, records, _specs_label(specs, "search")
 
 
 def resolve_queries(specs, recursive: bool = True,
@@ -321,4 +427,3 @@ def resolve_queries(specs, recursive: bool = True,
                 f"No audio files found in {', '.join(silent)}.")
         raise FileNotFoundError(f"No audio files found in {shown}.")
     return uniq, _specs_label(specs, "query")
-

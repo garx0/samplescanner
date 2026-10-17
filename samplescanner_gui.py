@@ -2,10 +2,11 @@
 """
 Graphical front end for samplescanner.py — a front door, not a replacement.
 
-One file, two ways to run it:
+One file, three ways to run it:
 
   SampleScanner.exe                      the window
   SampleScanner.exe -q ... -s ... -v     the program, exactly as in a terminal
+  SampleScanner.exe --convert-caches     the converter of the old indexes
   python samplescanner_gui.py             the same split, from a source checkout
 
 The window picks the arguments, builds exactly the command line a user would
@@ -13,10 +14,14 @@ type in a terminal and runs it in a separate process, streaming the output as
 it arrives. The searching itself is done by samplescanner.py alone, so anything
 that can be done from a command line can still be done — the GUI only builds
 the command line, which is printed in the run window and can be copied out of
-it and used as it is.
+it and used as it is. The conversion of the indexes left over from an older
+version is a program of its own (convert_caches_1to2.py, reached by that one
+argument in a build) and is run in the same window the same way, because it is
+the same kind of job: minutes of work the window must survive.
 
 Only tkinter is used: it comes with python itself, nothing to install.
 """
+import json
 import os
 import queue
 import shutil
@@ -67,9 +72,15 @@ def hide_own_console() -> None:
 
 # One file, two ways to run it: with arguments it is the program itself — the
 # same main() that python samplescanner.py calls — and without them it is the
-# window that builds the arguments for it.
+# window that builds the arguments for it. The converter is a third thing the
+# same launcher can be, reached by the one argument that says so, so that a build
+# of this program ships the converter without a second exe next to the first.
 if len(sys.argv) > 1:
-    from samplescanner import main                             # noqa: E402
+    from ssc.launcher import CONVERT_FLAG                  # noqa: E402
+    if sys.argv[1] == CONVERT_FLAG:
+        from convert_caches_1to2 import main                # noqa: E402
+        sys.exit(main(sys.argv[2:]))
+    from samplescanner import main                         # noqa: E402
     sys.exit(main(sys.argv[1:]))
 hide_own_console()
 
@@ -95,7 +106,8 @@ HINT_WRAP = 600
 # the search will really try.
 from ssc.config import DEFAULT_BATCH                                      # noqa: E402
 from ssc.format import exe_name, fmt_elapsed
-from ssc.launcher import launcher_argv, launcher_dir                 # noqa: E402
+from ssc.launcher import (converter_argv, launcher_argv,         # noqa: E402
+                         launcher_dir)
 from ssc.pitch import (count_pitches, describe_pitch_order,          # noqa: E402
                        describe_pitch_set)
 from ssc.status import is_status, plain
@@ -307,6 +319,51 @@ def child_argv() -> list:
     return launcher_argv()
 
 
+def converter_child_argv() -> list:
+    """The command that converts the old indexes — a program of its own, run the
+    same separate way a search is, so that the window keeps answering while it
+    copies and its Stop button really stops it."""
+    return converter_argv()
+
+
+OLD_INDEX_VERSION = 1
+
+
+def old_cache_folders(work_dir: str) -> list:
+    """
+    The cache folders in `work_dir` that are in an index version this build no
+    longer reads, and the user could convert.
+
+    Read here rather than imported, on purpose: this runs in the window, before
+    anything has been picked, and it must stay cheap. Asking ssc.cache would pull
+    numpy into the window for the sake of a number in one small file, so the two
+    things that are actually needed — where the cache is and what its manifests
+    say — are read straight from the disk instead.
+
+    The old folders are not removed by converting them (that is the user's
+    command to give), so this keeps answering yes for as long as they are there.
+    That is the honest answer to ask: the folders really are still unreadable,
+    and only the user can decide whether to keep them or convert them again.
+    """
+    base = os.path.join(work_dir, "cache")
+    out = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in names:
+        mpath = os.path.join(base, name, "manifest.json")
+        if not os.path.isfile(mpath):
+            continue
+        try:
+            with open(mpath, "r", encoding="utf-8") as fh:
+                if json.load(fh).get("version") == OLD_INDEX_VERSION:
+                    out.append(os.path.join(base, name))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
 def show_argv(argv: list) -> str:
     """
     The command as a person would type it, for the line at the top of the run
@@ -344,10 +401,17 @@ class RunWindow(tk.Toplevel):
     Shows stdout of the search while it runs. The lines are read in a thread and
     handed over through a queue — tkinter may only be touched from the thread it
     was started in.
+
+    The same window runs the index conversion, so it is told what the run is
+    rather than assuming: the title, the wording of the questions, and which of
+    the buttons have anything to offer all depend on that. `on_done` is called
+    once the run has finished, with its exit code, so the caller can ask the
+    question that belongs to the result.
     """
-    def __init__(self, master, argv, cwd):
+    def __init__(self, master, argv, cwd, title=None, what="the search",
+                 has_results=True, on_done=None):
         super().__init__(master)
-        self.title(f"Search running — {version_line()}")
+        self.title(title or f"Search running — {version_line()}")
         self.geometry("1000x640")
         self.minsize(640, 400)
         self.proc = None
@@ -355,6 +419,8 @@ class RunWindow(tk.Toplevel):
         self.results_dir = None
         self.finished = False
         self.silent = 0
+        self.what = what
+        self.on_done = on_done
 
         top = ttk.Frame(self, padding=(8, 6))
         top.pack(fill=tk.X)
@@ -368,11 +434,13 @@ class RunWindow(tk.Toplevel):
         bar.pack(fill=tk.X)
         self.stop_btn = ttk.Button(bar, text="Stop", command=self.stop)
         self.stop_btn.pack(side=tk.LEFT)
-        self.open_btn = ttk.Button(bar, text="Open results folder",
-                                   command=lambda: open_in_explorer(
-                                       self.results_dir or ""),
-                                   state="disabled")
-        self.open_btn.pack(side=tk.LEFT, padx=6)
+        self.open_btn = None
+        if has_results:
+            self.open_btn = ttk.Button(
+                bar, text="Open results folder",
+                command=lambda: open_in_explorer(self.results_dir or ""),
+                state="disabled")
+            self.open_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(bar, text="Save output…",
                    command=self.save).pack(side=tk.LEFT)
         self.follow = tk.BooleanVar(value=True)
@@ -481,7 +549,7 @@ class RunWindow(tk.Toplevel):
             self._lines += 1
             if line.startswith(CONFIRM_MARKER):
                 self._answer_confirmation(line)
-            if line.startswith("RESULTS   :"):
+            if self.open_btn is not None and line.startswith("RESULTS   :"):
                 # the line says "not written" when nothing is to be cut —
                 # only a folder that is really there may be opened
                 path = line.split(":", 1)[1].strip()
@@ -562,12 +630,17 @@ class RunWindow(tk.Toplevel):
         if self.results_dir:
             self._put(f"\nThe fragments are in {self.results_dir}",
                       "head")
+        # what happens now depends on WHAT ran: a finished search needs nothing,
+        # a finished conversion has a question of its own to ask. Left to the
+        # caller, which is the only one that knows the answer.
+        if self.on_done is not None:
+            self.on_done(code or 0)
 
     # ---------- buttons ----------
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self._put("\nstopped by the user", "bad")
+            self._put(f"\n{self.what} stopped by the user", "bad")
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
@@ -589,8 +662,9 @@ class RunWindow(tk.Toplevel):
 
     def on_close(self):
         if self.proc and self.proc.poll() is None:
-            if not messagebox.askyesno("The search is still running",
-                                       "Stop the search and close?"):
+            if not messagebox.askyesno(
+                    f"{self.what.capitalize()} is still running",
+                    f"Stop the {self.what} and close?"):
                 return
             self.stop()
         self.destroy()
@@ -1285,6 +1359,9 @@ class App(tk.Tk):
         # into, next to the exe — never in the working directory of whoever
         # started it
         self.work_dir = tk.StringVar(value=program_dir())
+        # the window of a running conversion, so that its result can be acted on
+        # and the window closed; None when none is running
+        self._converter_win = None
 
         head = ttk.Frame(self, padding=(24, 22, 24, 6))
         head.pack(fill=tk.X)
@@ -1342,7 +1419,99 @@ class App(tk.Tk):
                 "ffprobe was not found", FFPROBE_QUESTION, parent=self,
                 default=messagebox.NO):
             return
+        if not self.offer_conversion():
+            return
         SearchDialog(self, self)
+
+    # ---------- the old indexes ----------
+
+    def offer_conversion(self):
+        """
+        Offers to convert the indexes of an older format, and returns whether the
+        search may go ahead either way.
+
+        The question is asked here, before anything is picked, because it is about
+        what is already on the disk and not about this search: the answer changes
+        how long the search that follows takes, not what it finds. It is asked on
+        every New search while such a folder is still there, since the conversion
+        does not remove it — that is left to Clear the cache, so that a user who
+        wants to go back to the previous version of the program still can.
+
+        Saying no is not a wall: the search goes on, and the indexes of that old
+        folder are simply not read, so they will be built again if and when that
+        collection is searched.
+        """
+        work = self.work_dir.get().strip() or program_dir()
+        old = old_cache_folders(work)
+        if not old:
+            return True
+        names = ", ".join(os.path.basename(p) for p in old[:6])
+        if len(old) > 6:
+            names += f" and {len(old) - 6} more"
+        yes = messagebox.askyesno(
+            "Indexes of an older format",
+            f"You have library indexes (cache) saved before SampleScanner "
+            f"v0.2.3:\n\n{names}\n\n"
+            f"You should convert them to new format to be able to read them "
+            f"in current version of SampleScanner. Otherwise they will be "
+            f"ignored, and when you search in these libraries again, you'll "
+            f"have to wait for new indexes (cache) to be rebuilt from "
+            f"scratch.\n\nConvert?",
+            parent=self, default=messagebox.YES)
+        if not yes:
+            return True
+        self.open_converter()
+        # the search itself waits for the answer to the conversion: either the
+        # form opens from the run window's own dialog, or the user stays here
+        return False
+
+    def open_converter(self):
+        """
+        Runs the conversion in its own window, the way a search is run, so that
+        the copy of a large index is minutes of solid work the window survives.
+
+        Whether the search form opens afterwards is decided by the answer to the
+        question the run window asks when it is over, and not here: the point of
+        promising "create a new search?" on success is only kept if the decision
+        is taken with the result in front of the user.
+        """
+        work = os.path.abspath(self.work_dir.get().strip() or program_dir())
+        self._converter_win = RunWindow(
+            self, converter_child_argv(), work,
+            title=f"Converting the indexes — {version_line()}",
+            what="the conversion", has_results=False,
+            on_done=self.conversion_finished)
+
+    def conversion_finished(self, code: int):
+        """
+        What the conversion being over means for the search that was promised.
+
+        Whichever way the question below is answered, the run window closes: it
+        has said all it had to say, and leaving it open would put a window that
+        finished several minutes ago between the user and the search.
+
+        A conversion that failed does not ask at all. There is nothing new to
+        search with — the old indexes are still unreadable — so offering a form
+        would only produce a search that rebuilds exactly what was just asked
+        about; the user presses New search again and decides for themselves.
+        """
+        win = self._converter_win
+        self._converter_win = None
+        go_on = False
+        if code == 0:
+            go_on = messagebox.askyesno(
+                "The indexes were converted",
+                "The old indexes were converted successfully, you'll be able "
+                "to reuse them in new searches now.\n\n"
+                "Old-format indexes were moved to cache_todelete folder and are "
+                "no longer read. Delete them by hand, or leave them as a backup "
+                "in case the new-format indexes won't work properly (they haven't "
+                "been tested exhaustively yet).\n\nCreate new search?",
+                parent=self, default=messagebox.YES)
+        if win is not None:
+            win.destroy()
+        if go_on:
+            SearchDialog(self, self)
 
     def show_help(self):
         HelpWindow(self)

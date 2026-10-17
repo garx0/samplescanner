@@ -126,7 +126,11 @@ BATCH_WINDOWS = 32         # windows per ffmpeg; more is barely quicker and the
                            # command line grows with every one of them
 BATCH_MAX_COMMAND = 8000   # characters of command line per ffmpeg, a collection
                            # path being repeated once per input
-INDEX_VERSION = 1
+# 2 is the shared cache tree: cache/<X>_/<Y>_/ with a manifest per <Y> that
+# records which library folder it stands for. Version 1 indexes are NOT read -
+# see the migration in ssc/cache.py's design notes - so a user with a v1 cache
+# rebuilds it or converts it.
+INDEX_VERSION = 2
 
 REF_TAIL_PAD = 512   # zero frames appended past the end (≈3 s at HOP=128)
 

@@ -97,12 +97,14 @@ from ssc.config import (COARSE_BANDS, COARSE_HOP, DEFAULT_BATCH,
                         EQUIV_TOL, EXPORT_MIN_MARGIN, EXPORT_MIN_SIM, HOP,
                         INDEX_SIZE_WARN, INTERMEDIATE_SUBDIR, LOG_PREFIX,
                         ROUND_STOP_SHARE, SAMPLE_RATE, UNSURE_MIN_SIM)
+from ssc import cache
 from ssc.export import export_report, results_folder
 from ssc.features import logmel_bank
 from ssc.format import fmt_duration, fmt_elapsed, fmt_size, fmt_time
 from ssc.index import (CoarseIndex, CoarseCandidate, IndexPlan, SearchIndex,
-                       coarse_search_many, default_index_dir, format_plan)
-from ssc.inputs import resolve_queries, resolve_sources
+                       coarse_search_many, format_plan)
+from ssc.inputs import (resolve_queries, resolve_source_records,
+                        resolve_sources, top_folders)
 from ssc.paths import ensure_writable_dir
 from ssc.pitch import (fmt_semitones, normalise_pitch_args, parse_pitch_args)
 from ssc.progress import INTERVAL, Progress
@@ -182,8 +184,8 @@ class NoSpaceError(RuntimeError):
             f"{fmt_size(plan.bytes_estimate)}, but only "
             f"{fmt_size(plan.free_bytes)} is free on the drive that holds "
             f"{plan.index_dir}.\n"
-            f"The search is NOT started: free up some space, or point the "
-            f"cache elsewhere with --index-dir, and run it again.")
+            f"The search is NOT started: free up some space on that drive, "
+            f"or move the program's folder to another one, and run it again.")
 
 
 def confirm_large_index(args, plan: IndexPlan) -> bool:
@@ -963,6 +965,25 @@ def report_error(text: str) -> None:
             pass
 
 
+def _index_files(base, names):
+    """
+    The library's files as (absolute path, size, modification time).
+
+    Size and modification time are what the index decides a cached file by, so
+    they have to be read before the plan is made. One stat per file, and the
+    same stat the old index needed to make the same decision.
+    """
+    out = []
+    for n in names:
+        full = os.path.join(base, n) if base else n
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        out.append((os.path.abspath(full), st.st_size, st.st_mtime))
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1034,11 +1055,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     metavar="SEC",
                     help="index only the first SEC seconds of every source "
                          "(a quick check)")
-    ap.add_argument("--index-dir", default=None, metavar="DIR",
-                    help="where to keep the on-disk index (by default "
-                         "./cache/<collection>, next to the query folder)")
-    ap.add_argument("--rebuild-index", action="store_true",
-                    help="rebuild the index from scratch, do not use the cache")
     ap.add_argument("--no-export", action="store_true",
                     help="do not cut any fragment to disk at all")
     ap.add_argument("--export-min-sim", type=float, default=EXPORT_MIN_SIM,
@@ -1173,8 +1189,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{args.only!r} filter.")
         # -s may be a folder, a glob pattern or a text file listing either, so
         # it is resolved into ONE base folder plus the names below it
-        s_base, names, s_root = resolve_sources(
+        s_base, names, records, s_root = resolve_source_records(
             args.search, recursive=not args.no_recurse)
+        top_of = top_folders(records)
 
         # ONE results folder per run inside results/, holding the fragments of
         # every query of this run: the confident ones directly, the weak ones in
@@ -1215,22 +1232,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not names:
             raise FileNotFoundError(
                 f"Nothing left in {', '.join(args.search)} after the --only {args.only!r} filter.")
-        idx_dir = args.index_dir or default_index_dir(s_base)
-        if args.rebuild_index and os.path.isdir(idx_dir):
-            shutil.rmtree(idx_dir, ignore_errors=True)
         if args.verbose:
-            print(f"Coarse index: {idx_dir}", flush=True)
+            print(f"Coarse index: {cache.cache_root()}", flush=True)
 
         # --- what the index of this collection will cost, before it exists ---
-        # The plan reads the manifest and the headers of the missing files and
+        # The plan reads the manifests and the headers of the missing files and
         # writes NOTHING: a search over a big collection should be able to say
         # "this needs 3.4 GB" while the user can still do something about it.
         # It is said out loud, because on a large collection the estimate is
-        # itself a long silence — every file of it is asked whether the index
-        # already holds it, and how long it is.
+        # itself a long silence — every file of it is asked which cache folder it
+        # belongs in, whether the index already holds it, and how long it is.
         flash("Estimating size of index to build (or update)")
-        coarse = CoarseIndex(s_base, idx_dir)
-        plan = coarse.plan(names)
+        coarse = CoarseIndex(s_base)
+        plan = coarse.plan(_index_files(s_base, names), top_of)
         for i, line in enumerate(format_plan(plan)):
             print(f"{'PLAN      :' if i == 0 else '            '}{line}")
         if not plan.fits:
@@ -1240,12 +1254,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("STOPPED   : the index was not built — it was "
                       "confirmed away")
                 return 3
-        ensure_writable_dir(idx_dir,
-                            "the index of the collection (the cache folder)")
+        ensure_writable_dir(coarse.root, "the index (the cache folder)")
 
         flash("building the index")
         t0 = time.perf_counter()
-        fresh, cached = coarse.build(names, jobs=args.jobs, verbose=args.verbose)
+        fresh, cached = coarse.build(jobs=args.jobs, verbose=args.verbose)
+        coarse.finish()
+        t_index = time.perf_counter() - t0
         t_index = time.perf_counter() - t0
         total_audio = sum(e.duration for e in coarse.entries)
         index = SearchIndex(folder=s_base, sources=[], coarse=coarse)
@@ -1255,7 +1270,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         indexed = fresh - len(skipped)
         print(f"INDEX     : build in {t_index:.2f} s — {len(coarse.entries)} "
               f"file(s), {fmt_duration(total_audio)} of audio")
-        print(f"            {idx_dir}, {coarse.bytes_on_disk/1024/1024:.1f} MB "
+        print(f"            {coarse.root}, {coarse.bytes_on_disk/1024/1024:.1f} MB "
               f"({indexed} recomputed, {cached} from cache), "
               f"hop {COARSE_HOP/SAMPLE_RATE*1000:.0f} ms, "
               f"{COARSE_BANDS} bands")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures as futures
-import hashlib
 import json
 import os
 import re
@@ -14,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.signal import fftconvolve
 
+from ssc import cache
 from ssc.audio import (audio_duration, list_audio_files, load_audio,
                        load_audio_many)
 from ssc.config import (BANK, BATCH_WINDOWS, COARSE_BANDS, COARSE_DTYPE,
@@ -29,8 +29,7 @@ from ssc.config import (BANK, BATCH_WINDOWS, COARSE_BANDS, COARSE_DTYPE,
 from ssc.features import (PreparedRef, build_views, coarse_logmel, frame_center,
                           frame_correlations, logmel_bank, prepare_ref,
                           similarity_at, time_delta)
-from ssc.format import _ILLEGAL, fmt_duration, fmt_size, safe_stem
-from ssc.paths import program_dir
+from ssc.format import fmt_duration, fmt_size
 from ssc.progress import Progress
 
 # --------------------------------------------------------------------------- #
@@ -93,9 +92,11 @@ class SearchIndex:
 @dataclass
 class CoarseEntry:
     """One source file inside the on-disk index."""
-    name: str                  # path relative to the search root
+    name: str                  # how the file is reported: relative to the search base
     path: str                  # full path to the audio file
-    bin: str                   # name of the file holding the features
+    bin: str                   # name of the .npy pair holding the features
+    dir: str                   # the cache folder that pair is in
+    src: str                   # the file's name inside that cache folder
     n_coarse: int
     duration: float
     size: int
@@ -113,7 +114,7 @@ class IndexPlan:
     seconds: float              # audio length of the missing ones, s
     unknown: List[str]          # files whose length could not be read
     bytes_estimate: int         # what they will take on disk
-    index_dir: str
+    index_dir: str              # the cache root they will go under
     free_bytes: int             # free space on the drive holding the cache
 
     @property
@@ -153,8 +154,8 @@ def format_plan(plan: IndexPlan) -> List[str]:
     lines = [what,
              f"they hold ≈{fmt_duration(plan.seconds)} of audio and will "
              f"take about {fmt_size(plan.bytes_estimate)} of index "
-             f"({INDEX_BYTES_PER_SECOND // 1024} KB/s)"
-             f" — in cache/{os.path.basename(plan.index_dir)}",
+             f"({INDEX_BYTES_PER_SECOND // 1024} KB/s)",
+             f"in {plan.index_dir}",
              f"free space on the drive: {fmt_size(plan.free_bytes)}"]
     if plan.unknown:
         lines.append(f"the length of {len(plan.unknown)} file(s) could not be "
@@ -164,81 +165,93 @@ def format_plan(plan: IndexPlan) -> List[str]:
 
 class CoarseIndex:
     """
-    The collection index, kept on disk. Every file gets a pair of .npy files:
-    log-mel (float16) and frame energy (float32). A manifest records them, so
-    on repeated runs everything unchanged is reused (size and modification
-    time are compared).
+    The index, kept on disk. Every file gets a pair of .npy files - log-mel
+    (float16) and frame energy (float32) - in a cache folder that belongs to one
+    library folder and to no other. The layout, the matching of a library folder
+    to its cache folder and the naming of everything in between live in ssc.cache;
+    this class is the part that reads and writes features.
 
     Only one file is loaded into memory at a time, so the memory cost depends
     on the length of the longest single track, not on the collection size.
     """
-    def __init__(self, folder: str, index_dir: str):
-        self.folder = folder
-        self.abs_folder = os.path.abspath(folder)
-        self.dir = index_dir
+    def __init__(self, report_base: str = "", root: Optional[str] = None):
+        self.base = report_base
+        self.root = os.path.abspath(root or cache.cache_root())
         self.entries: List[CoarseEntry] = []
         self.bytes_on_disk = 0
+        self.skipped: List[str] = []
+        self._layout: Optional[cache.Assignment] = None
+        self._todo: Dict[str, List[cache.LibFile]] = {}
+        self._cached = 0
+        self._missing: List[str] = []
+        self._orphans: List[str] = []
+        self._records: Dict[str, Dict[str, dict]] = {}
+        self._by_name: Dict[str, CoarseEntry] = {}
 
     # ---------- planning ----------
 
-    def plan(self, names: Sequence[str]) -> IndexPlan:
+    def plan(self, files: Sequence[Tuple[str, int, float]],
+             top_of: Optional[Dict[str, str]] = None) -> IndexPlan:
         """
-        What the index of this collection WOULD cost, before anything is
-        written: which of the files are not in the cache yet, how much audio
-        that is, and how many bytes it takes on disk.
+        What the index of these files WOULD cost, before anything is written:
+        which cache folder each one belongs in, which of them are already there,
+        how much audio the rest hold, and how many bytes they take on disk.
 
-        Nothing is created and nothing is decoded — the length of a file is
-        read from its header. The number is an estimate, and it is meant to run
+        Nothing is created and nothing is decoded - the length of a file is read
+        from its header. The number is an estimate, and it is meant to run
         slightly high: measured against real indexes it is about 5 % over,
         because the estimate cannot see the .npy headers and the slack of the
         file system.
+
+        `top_of` maps a file to the library folder it was picked through; the
+        cache groups by that, so two packs that happen to share a folder name do
+        not end up fighting over one cache folder.
         """
-        todo, cached = self._partition(names)
-        missing = [n for n, prev in todo if prev is None]
+        self._layout = cache.assign(cache.scan(self.root),
+                                    cache.group_library(files), top_of or {})
+        self._todo = {}
+        self._cached = 0
+        self._missing = []
+        self._orphans = []
+        self._records = {}
+
+        for folder_path, in_folder in sorted(self._layout.files.items()):
+            cf = self._layout.folders.get(folder_path)
+            for name, lf in sorted(in_folder.items()):
+                rec = cf.entries.get(name) if cf is not None else None
+                if rec is not None and cf.matches(name, lf.size, lf.mtime):
+                    feats = os.path.join(folder_path, rec["bin"])
+                    ener = os.path.join(folder_path, _energy_bin(rec["bin"]))
+                    have_f, have_e = os.path.exists(feats), os.path.exists(ener)
+                    if have_f and have_e:
+                        self._cached += 1
+                        self._records.setdefault(folder_path, {})[name] = rec
+                        continue
+                    # half a pair is worth nothing to anybody, and leaving it
+                    # there would keep the folder failing every test until it was
+                    # built again. It goes with the rebuild below.
+                    self._orphans.append(feats if have_f else ener)
+                self._todo.setdefault(folder_path, []).append(lf)
+                self._missing.append(lf.path)
+
         seconds = 0.0
         unknown: List[str] = []
-        for n in missing:
+        for p in self._missing:
             try:
-                seconds += audio_duration(os.path.join(self.folder, n))
+                seconds += audio_duration(p)
             except (RuntimeError, OSError, ValueError):
-                unknown.append(n)
+                unknown.append(p)
         need = int(seconds * INDEX_BYTES_PER_SECOND
-                   + len(missing) * INDEX_BYTES_PER_FILE)
-        return IndexPlan(total=len(names), cached=cached, missing=missing,
-                         seconds=seconds, unknown=unknown,
-                         bytes_estimate=need,
-                         index_dir=self.dir,
-                         free_bytes=free_space_at(self.dir))
-
-    def _partition(self, names: Sequence[str]
-                   ) -> Tuple[List[Tuple[str, Optional[dict]]], int]:
-        """
-        Splits the files into (name, what the manifest has for it) — a dict to
-        reuse, or None to compute. Used by plan() and by build() so that "what
-        is missing" is decided in exactly one place.
-        """
-        old = self._load_manifest()
-        wanted = {n: self._stat(n) for n in names}
-        todo: List[Tuple[str, Optional[dict]]] = []
-        cached = 0
-        for n in names:
-            size, mtime = wanted[n]
-            prev = old.get(n)
-            if prev and prev.get("size") == size \
-                    and abs(prev.get("mtime", -1) - mtime) < 1e-6 \
-                    and os.path.exists(os.path.join(self.dir, prev["bin"])) \
-                    and os.path.exists(os.path.join(self.dir,
-                                                    _energy_bin(prev["bin"]))):
-                todo.append((n, prev))     # reuse
-                cached += 1
-            else:
-                todo.append((n, None))
-        return todo, cached
+                   + len(self._missing) * INDEX_BYTES_PER_FILE)
+        return IndexPlan(total=len(files), cached=self._cached,
+                         missing=list(self._missing), seconds=seconds,
+                         unknown=unknown, bytes_estimate=need,
+                         index_dir=self.root,
+                         free_bytes=free_space_at(self.root))
 
     # ---------- building ----------
 
-    def build(self, names: Sequence[str], jobs: int = 0,
-              verbose: bool = False) -> Tuple[int, int]:
+    def build(self, jobs: int = 0, verbose: bool = False) -> Tuple[int, int]:
         """
         Completes the index. Returns (rebuilt, taken from cache).
 
@@ -253,170 +266,163 @@ class CoarseIndex:
         disk, a cache that cannot be written — still stops the run: those are not
         the file's fault, and a half-written index would be worse than none.
         """
-        os.makedirs(self.dir, exist_ok=True)
-        todo, cached = self._partition(names)
-        wanted = {n: self._stat(n) for n in names}
-        fresh = [t for t in todo if t[1] is None]
-        if verbose and cached:
-            print(f"  {cached} file(s) taken from the index cache, "
-                  f"{len(fresh)} recomputed", flush=True)
+        if self._layout is None:
+            raise RuntimeError("plan() must come before build()")
+        todo_total = sum(len(v) for v in self._todo.values())
+        if verbose and self._cached:
+            print(f"  {self._cached} file(s) taken from the index cache, "
+                  f"{todo_total} recomputed", flush=True)
+
+        for orphan in self._orphans:
+            try:
+                os.remove(orphan)
+            except OSError:
+                pass
 
         # the files already in the cache need nothing computed, so the bar
         # starts where the work really starts
-        bar = Progress(len(todo), text="building index", done=cached).start()
-        self.skipped: List[str] = []
+        bar = Progress(todo_total + self._cached, text="building index",
+                       done=self._cached).start()
+        self.skipped = []
+        fresh = 0
         try:
-            # only the files that are not in the cache yet: the cached ones are
-            # already counted, and `one` never sees them
-            def one(name):
-                size, mtime = wanted[name]
-                bin_name = _index_bin_name(name)
-                try:
-                    audio = load_audio(os.path.join(self.folder, name))
-                except (RuntimeError, OSError) as exc:
-                    self.skipped.append(name)
-                    why = (" ".join(str(exc).split())[:150] or exc.__class__.__name__)
-                    why = why.rstrip(": ")
-                    print(f"  WARNING: skipping {name} — the file cannot be "
-                          f"read: {why}", flush=True)
-                    return name, None, False
-                data, energy = coarse_logmel(audio)
-                np.save(os.path.join(self.dir, bin_name),
-                        data.astype(COARSE_DTYPE))
-                np.save(os.path.join(self.dir, _energy_bin(bin_name)), energy)
-                rec = {"bin": bin_name, "n_coarse": int(data.shape[0]),
-                       "duration": float(len(data) * COARSE_HOP / SAMPLE_RATE),
-                       "size": size, "mtime": mtime}
-                bar.step()
-                return name, rec, False
-
-            fresh_names = [n for n, _ in fresh]
-            if fresh_names and jobs != 1 and len(fresh_names) > 1:
-                with futures.ThreadPoolExecutor(
-                        max_workers=jobs if jobs > 0 else
-                        max(1, (os.cpu_count() or 2) - 1)) as pool:
-                    done = list(pool.map(one, fresh_names))
-            else:
-                done = [one(n) for n in fresh_names]
+            for folder_path, files in sorted(self._todo.items()):
+                os.makedirs(folder_path, exist_ok=True)
+                done = self._compute(files, folder_path, jobs, bar)
+                fresh += len(done)
+                self._records.setdefault(folder_path, {}).update(done)
         finally:
-            bar.close()            # also when a file turned out to be unreadable
-        recs: Dict[str, dict] = {n: rec for n, rec, _ in done if rec is not None}
-        for n, prev_rec in todo:
-            if prev_rec is not None:
-                recs[n] = prev_rec
+            bar.close()        # also when a file turned out to be unreadable
+        return fresh, self._cached
 
-        self.entries = []
-        for n in names:
-            rec = recs.get(n)
-            if rec is None:      # skipped above: it is not in the index
-                continue
-            self.entries.append(CoarseEntry(
-                name=n, path=os.path.join(self.folder, n), bin=rec["bin"],
-                n_coarse=int(rec["n_coarse"]), duration=float(rec["duration"]),
-                size=int(rec["size"]), mtime=float(rec["mtime"])))
-        self._save_manifest()
-        self._measure_disk()
-        return len(fresh), cached
+    def _compute(self, files: Sequence[cache.LibFile], folder_path: str,
+                 jobs: int, bar: Progress) -> Dict[str, dict]:
+        """Features of one cache folder's missing files, written next to each other."""
+        def one(lf: cache.LibFile) -> Tuple[str, Optional[dict]]:
+            bin_name = _index_bin_name(lf.name)
+            try:
+                audio = load_audio(lf.path)
+            except (RuntimeError, OSError) as exc:
+                self.skipped.append(lf.path)
+                why = (" ".join(str(exc).split())[:150] or exc.__class__.__name__)
+                print(f"  WARNING: skipping {os.path.basename(lf.path)} — the "
+                      f"file cannot be read: {why.rstrip(': ')}", flush=True)
+                return lf.name, None
+            data, energy = coarse_logmel(audio)
+            _save_pair(folder_path, bin_name, data.astype(COARSE_DTYPE), energy)
+            rec = {"bin": bin_name, "n_coarse": int(data.shape[0]),
+                   "duration": float(len(data) * COARSE_HOP / SAMPLE_RATE),
+                   "size": lf.size, "mtime": lf.mtime}
+            bar.step()
+            return lf.name, rec
 
-    def _stat(self, name: str) -> Tuple[int, float]:
-        st = os.stat(os.path.join(self.folder, name))
-        return st.st_size, st.st_mtime
+        if len(files) > 1 and jobs != 1:
+            with futures.ThreadPoolExecutor(
+                    max_workers=jobs if jobs > 0 else
+                    max(1, (os.cpu_count() or 2) - 1)) as pool:
+                done = list(pool.map(one, files))
+        else:
+            done = [one(f) for f in files]
+        return {name: rec for name, rec in done if rec is not None}
 
-    def _load_manifest(self) -> Dict[str, dict]:
-        path = os.path.join(self.dir, "manifest.json")
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if data.get("version") != INDEX_VERSION \
-                    or data.get("coarse_nfft") != COARSE_NFFT \
-                    or data.get("coarse_hop") != COARSE_HOP \
-                    or data.get("coarse_bands") != COARSE_BANDS:
-                # the numbers in the index were computed with other parameters,
-                # so none of it can be reused whatever the files look like now
-                return {}
-            # The folder this cache was built for is recorded, but no longer
-            # decides anything. A collection spread over several drives has no
-            # one folder to name — for that, and for a program that has been
-            # moved to another disk to escape a full one, the address was the
-            # only thing tying a perfectly good index to where it was built, and
-            # moving the program threw away gigabytes of decoding for nothing.
-            # What the cache actually holds is decided per file, by size and
-            # modification time, in _split() — a stricter test than comparing
-            # one string with another, and the reason two collections of the same
-            # name still do not get mixed up.
-            return {e["name"]: e for e in data.get("entries", [])}
-        except (OSError, ValueError, KeyError):
-            return {}
+    def finish(self) -> None:
+        """
+        Writes the manifests and collects the entries for the search.
 
-    def _save_manifest(self) -> None:
-        path = os.path.join(self.dir, "manifest.json")
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"version": INDEX_VERSION,
-                       "coarse_nfft": COARSE_NFFT, "coarse_hop": COARSE_HOP,
-                       "coarse_bands": COARSE_BANDS,
-                       "folder": self.abs_folder,
-                       "entries": [{"name": e.name, "bin": e.bin,
-                                    "n_coarse": e.n_coarse,
-                                    "duration": e.duration, "size": e.size,
-                                    "mtime": e.mtime} for e in self.entries]},
-                      fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
-
-    def _measure_disk(self) -> None:
+        Separate from build() because a manifest that lists a file whose features
+        were never written is a lie the next run would believe: what a folder
+        holds is recorded only once its features are all on disk.
+        """
+        assert self._layout is not None
+        entries: List[CoarseEntry] = []
         self.bytes_on_disk = 0
-        for e in self.entries:
-            for p in (os.path.join(self.dir, e.bin),
-                      os.path.join(self.dir, _energy_bin(e.bin))):
-                if os.path.exists(p):
-                    self.bytes_on_disk += os.path.getsize(p)
+        for folder_path, in_folder in sorted(self._layout.files.items()):
+            cf = self._layout.folders.get(folder_path) or cache.CacheFolder(
+                path=folder_path, source=self._layout.source[folder_path])
+            # the source folder is written every time: for a folder that was
+            # moved it is how the cache learns where the library went
+            cf.source = self._layout.source[folder_path]
+            records = self._records.get(folder_path, {})
+            for name, lf in sorted(in_folder.items()):
+                rec = records.get(name)
+                if rec is None:
+                    continue
+                cf.entries[name] = rec
+                entries.append(CoarseEntry(
+                    name=self._report_name(lf.path), path=lf.path,
+                    bin=rec["bin"], dir=folder_path, src=name,
+                    n_coarse=int(rec["n_coarse"]),
+                    duration=float(rec["duration"]), size=lf.size,
+                    mtime=lf.mtime))
+            cache.save_folder(cf)
+            self.bytes_on_disk += _folder_bytes(folder_path)
+        self.entries = entries
+        self._by_name = {e.name: e for e in entries}
+
+    def _report_name(self, path: str) -> str:
+        """How a file is named in the report and in the fragments: as the user
+        would type it relative to the folder they searched."""
+        if not self.base:
+            return path
+        try:
+            return os.path.relpath(path, self.base)
+        except ValueError:       # a different drive: there is no relative form
+            return path
 
     # ---------- reading ----------
 
     def by_name(self, name: str) -> CoarseEntry:
-        for e in self.entries:
-            if e.name == name:
-                return e
-        raise KeyError(name)
+        return self._by_name[name]
 
     def load_entry(self, e: CoarseEntry) -> Tuple[np.ndarray, np.ndarray]:
         """Reads the features and energy of one file (as float32 in RAM)."""
-        feats = np.load(os.path.join(self.dir, e.bin),
+        feats = np.load(os.path.join(e.dir, e.bin),
                         mmap_mode=None).astype(np.float32)
-        energy = np.load(os.path.join(self.dir, _energy_bin(e.bin))
+        energy = np.load(os.path.join(e.dir, _energy_bin(e.bin))
                          ).astype(np.float32)
         return feats, energy
 
 
-def _energy_bin(bin_name: str) -> str:
-    """Name of the frame-energy file belonging to a feature file."""
-    stem = bin_name[:-4] if bin_name.endswith(".npy") else bin_name
-    return stem + "_e.npy"
-
-
 def _index_bin_name(name: str) -> str:
-    """Short, safe file name for the features (no paths, no collisions)."""
-    stem = safe_stem(name, 60)
-    digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
-    return f"{digest}_{stem}.npy"
+    """See cache.index_bin_name — the naming of the files inside a cache folder
+    belongs to the layout, which ssc.cache owns and the conversion needs too."""
+    return cache.index_bin_name(name)
 
 
-def default_index_dir(folder: str) -> str:
+def _energy_bin(bin_name: str) -> str:
+    """See cache.energy_bin."""
+    return cache.energy_bin(bin_name)
+
+
+def _save_pair(folder: str, bin_name: str, feats: np.ndarray,
+               energy: np.ndarray) -> None:
     """
-    Default index location: <program folder>/cache/<collection> — next to the
-    exe, so that a portable program keeps its index with itself and a source
-    checkout keeps it in the folder the program is run from.
+    Writes both halves of a file's features, each through a temporary name.
 
-    Two collections with the same name in different folders would land in one
-    cache folder. The manifest remembers the full path of the collection it was
-    built for and refuses a cache belonging to another one, so they do not mix
-    up even if their file names, sizes and timestamps happen to agree.
+    Two separate files cannot be written atomically, so what a crash can leave
+    behind is exactly one of the two under its final name - never half of
+    either. A lone half is worth nothing and is cleaned up when the index is
+    next read; the manifest is only written once both halves are there.
     """
-    name = _ILLEGAL.sub("_", os.path.basename(os.path.abspath(folder)))
-    name = re.sub(r"\s+", " ", name).strip(" .")[:60].rstrip(" .")
-    return os.path.join(program_dir(), "cache", name or "collection")
+    feats_path = os.path.join(folder, bin_name)
+    energy_path = os.path.join(folder, _energy_bin(bin_name))
+    for path, data in ((feats_path, feats), (energy_path, energy)):
+        tmp = path + ".tmp.npy"
+        with open(tmp, "wb") as fh:
+            np.save(fh, data)
+        os.replace(tmp, path)
+
+
+def _folder_bytes(folder: str) -> int:
+    total = 0
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                if e.is_file():
+                    total += e.stat().st_size
+    except OSError:
+        pass
+    return total
 
 
 # --------------------------------------------------------------------------- #
@@ -956,4 +962,3 @@ def build_index(folder: str, jobs: int = 0, verbose: bool = False,
             print(f"  {s.name}  —  {s.duration:7.1f} s, {s.n_frames} frames{note}",
                   flush=True)
     return SearchIndex(folder=folder, sources=built)
-
