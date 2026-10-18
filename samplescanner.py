@@ -235,7 +235,10 @@ class Shift:
     rep: Optional[Report] = None
     why: Optional[str] = None           # why it could not be searched, if so
     t_pass: float = 0.0                 # the whole pass that answered it
-    t_walk: float = 0.0                 # its share of that pass
+    # its share of that pass: the pass answered one query at one pitch per pair
+    # it was given, so dividing by that count is what makes a time that can be
+    # compared between a batch of many and a pass over every pitch
+    t_walk: float = 0.0
     t_report: float = 0.0
 
     @property
@@ -575,17 +578,18 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
         left = (f"    {'pitch':>6}  {'source':<{query.name_w}s} "
                 f"{'position':>9}  ")
         lines.append(f"{left}{'time spent':>10}  {'r':>6}  {'frames':>6}")
-        # what a pass cost is what the WHOLE batch cost - they were all
-        # computed in the same pass - so the column says so under itself
-        if nbatch > 1:
-            lines.append(" " * len(left)
-                         + f"{'(for ' + str(nbatch) + ' queries)':>10}")
     name = fit_name(rep.best.file_name, query.name_w)
     w = query.name_w
+    # the pass that answered this shift answered every pair of query and pitch it
+    # was given in one walk, and t_walk is this shift's share of it - the time for
+    # ONE query at ONE pitch, which is the only form of the number that can be
+    # read against another run: a batch of fifteen queries and a single query do
+    # not take the same time for a shift, and saying so under the header instead
+    # of dividing is what made the column unreadable
     lines.append(f"    {fmt_semitones(sh.pitch):>5} st  "
                  f"{name:<{w}s} "
                  f"{fmt_time(rep.offset):>9s}  "
-                 f"{fmt_elapsed(sh.t_pass):>10}  "
+                 f"{fmt_elapsed(sh.t_walk):>10}  "
                  f"{rep.score:6.3f}  "
                  f"{rep.best.frame_support*100:3.0f}%{mark}")
     query.entries.append((True, lines))

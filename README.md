@@ -77,6 +77,11 @@ Use case: start new search (with one or multiple samples to find in the selected
 library) and play the wav files (with the finds worth checking) appearing in the
 results/... folder while the search progresses.
 
+SampleScanner will take extra time indexing (caching) the files it sees for the 
+first time, so the next searches in the same folders will be faster (unless you 
+clear the `cache` folder). The index takes 4.2 KBytes per second of audio 
+(33.6 kbps).
+
 **What may be picked**, for both the query and the library:
 
 * one or several audio files (Ctrl and Shift pick several at once);
