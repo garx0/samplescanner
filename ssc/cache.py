@@ -30,9 +30,12 @@ into a cascade.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import re
+import shutil
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -44,6 +47,11 @@ from ssc.paths import program_dir
 # The pseudo-folder for "the files that sit in the root of a drive". Named so
 # that moving those files to the root of another drive needs no renaming.
 DISK_ROOT = "_disk_root"
+
+# The index version whose folders sit in the cache with their .npy in the folder
+# itself, before the second level existed. Nothing writes into one of those, and
+# nothing reads one either; they are the user's to convert or delete.
+OLD_INDEX_VERSION = 1
 
 # How long a folder name taken from the library may get. Windows caps a whole
 # path rather than a name, and cache/<X>_/<Y>_/ is already using a good part of
@@ -215,6 +223,21 @@ def lib_key(folder: str) -> str:
 # Manifests
 # --------------------------------------------------------------------------- #
 
+# What the next manifest is written under before it is renamed into place. The
+# number is in the name because the plain one is not enough: a build folder is
+# filled by several threads at once, and two searches started at the same time
+# from two terminals are two processes writing the same folder. Two of them
+# opening the same temporary file is a failure on Windows, which will not replace
+# a file another process still holds open.
+_tmp_names = itertools.count()
+
+# How hard to try putting the manifest in place. Windows refuses to replace a file
+# that anything else still holds open - most often whatever looked at what has
+# just been written - and lets go of it a moment later, so the answer is to wait
+# rather than to fail. A manifest is written often enough now, once per hundred
+# megabytes of features, for this to be a thing that actually happens.
+REPLACE_TRIES = 6
+
 @dataclass
 class CacheFolder:
     """One level-2 cache folder: the source folder it stands for, and its files."""
@@ -261,24 +284,57 @@ def load_folder(path: str) -> Optional[CacheFolder]:
         return None
 
 
-def save_folder(folder: CacheFolder) -> None:
-    """Writes the manifest, through a temporary file so a crash cannot cut it."""
+def save_folder(folder: CacheFolder, unfinished: bool = False) -> None:
+    """
+    Writes the manifest, through a temporary file so a crash cannot cut it.
+
+    `unfinished` says that the folder is still being built and this manifest is a
+    point along the way rather than the end of it. Nothing here changes because of
+    it: every entry written is true of what is on the disk, and the reader does
+    not need to know that more is coming - it counts what is cached and builds
+    the rest, which is what it would do with a manifest this same size written by
+    a run that had merely stopped.
+
+    It is written only when it is true, and a finished folder has no such field at
+    all rather than "unfinished": false. That keeps the manifest of a whole folder
+    exactly the one that has always been written, so a future version that knows
+    the field is not troubled by its absence, and cannot come to depend on it
+    being there.
+    """
     os.makedirs(folder.path, exist_ok=True)
     path = os.path.join(folder.path, "manifest.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"version": INDEX_VERSION,
-                   "coarse_nfft": COARSE_NFFT, "coarse_hop": COARSE_HOP,
-                   "coarse_bands": COARSE_BANDS,
-                   "folder": nfc(folder.source),
-                   "entries": [{"name": n, "bin": e["bin"],
-                                "n_coarse": int(e["n_coarse"]),
-                                "duration": float(e["duration"]),
-                                "size": int(e["size"]),
-                                "mtime": float(e["mtime"])}
-                               for n, e in sorted(folder.entries.items())]},
-                  fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.{next(_tmp_names)}.tmp"
+    data = {"version": INDEX_VERSION,
+            "coarse_nfft": COARSE_NFFT, "coarse_hop": COARSE_HOP,
+            "coarse_bands": COARSE_BANDS,
+            "folder": nfc(folder.source),
+            "entries": [{"name": n, "bin": e["bin"],
+                         "n_coarse": int(e["n_coarse"]),
+                         "duration": float(e["duration"]),
+                         "size": int(e["size"]),
+                         "mtime": float(e["mtime"])}
+                        for n, e in sorted(folder.entries.items())]}
+    if unfinished:
+        data["unfinished"] = True
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except OSError:
+        # a manifest that could not be written leaves what was there before,
+        # which is the state it was in a moment ago and not a worse one
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +377,15 @@ def scan(root: str) -> CacheScan:
             with os.scandir(e1.path) as it2:
                 for e2 in it2:
                     if not e2.is_dir():
+                        continue
+                    # A folder with no manifest is not a cache folder yet. It is
+                    # what a run that was stopped part way leaves behind - the
+                    # folder is made before the features go in - and counting it
+                    # would take the name away from the folder that has to be
+                    # written there, pushing every later run one digit further
+                    # down. Nothing is lost by ignoring it: the features in it are
+                    # not named by anything, so they are recomputed anyway.
+                    if not os.path.isfile(os.path.join(e2.path, "manifest.json")):
                         continue
                     under.add(e2.name)
                     out.by_lib.setdefault(
@@ -490,6 +555,12 @@ def step2(scanned: CacheScan, lib: Dict[str, LibFolder], matched: Step1,
     Files are collected first and named only afterwards. A folder's digit must
     not depend on the order the walk met its files in, or the same library laid
     down twice would land in two different places.
+
+    Two things are settled here rather than in the naming rule. A first-level
+    folder is reused instead of numbered, so that a collection searched twice ends
+    up in one place instead of two (see level1_name). And a folder left half built
+    by a run that was stopped is removed before any name is handed out, so that it
+    cannot squat the name the run needs (see drop_unfinished).
     """
     out = Step2()
     out.target.update(matched.assigned)
@@ -507,23 +578,151 @@ def step2(scanned: CacheScan, lib: Dict[str, LibFolder], matched: Step1,
     tops = {x: sorted(set(fs)) for x, fs in tops.items()}
 
     taken1 = set(scanned.level1)
-    level1_of: Dict[str, str] = {}
-    for x in sorted(tops):
-        name = level_name(lib_name(x), taken1)
-        taken1.add(name)
-        level1_of[x] = name
+    # by first-level folder, because two X of the same base name share one of them
+    # and must not both be offered the same second-level name
+    taken2: Dict[str, Set[str]] = {n: set(v)
+                                   for n, v in scanned.level2.items()}
 
     for x in sorted(tops):
-        l1 = level1_of[x]
-        l1_path = os.path.join(scanned.root, l1)
-        taken2 = set(scanned.level2.get(l1, set()))
+        l1_name = level1_name(lib_name(x), taken1, scanned.root)
+        taken1.add(l1_name)
+        l1_path = os.path.join(scanned.root, l1_name)
+        held = taken2.setdefault(l1_name, set())
+        wanted = {lib_name(folder) for folder in tops[x]}
+        drop_unfinished(l1_path, wanted)
         for folder in tops[x]:
-            name = level_name(lib_name(folder), taken2)
-            taken2.add(name)
+            name = level_name(lib_name(folder), held)
+            held.add(name)
             path = os.path.join(l1_path, name)
             out.target[folder] = path
             out.created[path] = folder
     return out
+
+
+def level1_name(base: str, taken: Set[str], root: str) -> str:
+    """
+    The first-level folder this X goes under.
+
+    It is `{base}_` whether or not that name is taken. A number here would only
+    mean that the same X asked for twice ends up in two folders, and a parent
+    searched with twenty globs would get twenty of them holding a couple of
+    subfolders each - the mess this level exists to prevent. Nothing on the first
+    level is read by a search: the name of the folder holding the audio is what is
+    looked up, and one collection searched twice is still one collection.
+
+    That the folder is reached by a different path the second time does not
+    matter, and could not be made to matter: a folder that was moved is adopted
+    under its new path and keeps the features it had, so the subfolders of one
+    first-level folder disagree about where the library went as soon as one album
+    moves.
+
+    Two kinds of folder of that name are not reused, and they are told apart by
+    what is inside rather than by what they are called.
+
+    An index of the OLDER format. It lies in the cache with its own manifest and
+    its .npy right in the folder - no second level at all - and a name of ours can
+    collide with it, trailing underscore and all. Its features are the only copy
+    this program has of everything that index holds, nothing here can read them,
+    and writing our folders in beside them would leave two indexes mixed in one
+    folder that neither can then claim. That one is left exactly as it is and this
+    X gets the next free number.
+
+    And a folder that is simply not an index: no manifest of its own, and no
+    folder of ours inside it either. That is what a run leaves behind when it is
+    stopped - the folder is made before the features go in and before any manifest
+    names them, so stopping early can leave the folder empty, or with .npy that no
+    manifest accounts for, or with a subfolder whose own features are in the same
+    state. Nothing on disk describes any of it, so none of it can be used by
+    anything, and it would sit on the one name this X wants and push every run
+    after it one digit further down. It is removed, and the name goes back into
+    use.
+    """
+    plain = f"{base}_"
+    if plain not in taken:
+        return plain
+    path = os.path.join(root, plain)
+    # One name is asked for more than once in a pass whenever two library
+    # folders share a basename, and the second of them is handed a name the
+    # first was given a moment ago with nothing on disk under it. There is
+    # nothing to remove then, and a line saying something was removed would be
+    # a thing that did not happen.
+    if not os.path.isdir(path):
+        return plain
+    if _is_ours(path):
+        return plain
+    if _is_old_index(path):
+        return level_name(base, taken)
+    shutil.rmtree(path, ignore_errors=True)
+    print(f"  CACHE    : removed {plain} — nothing in it was indexed "
+          f"(a folder with features and no manifest is of no use to anything)",
+          flush=True)
+    return plain
+
+
+def _is_old_index(path: str) -> bool:
+    """
+    Whether this folder is an index in the format before the two-level one.
+
+    Asked by the manifest lying in the folder itself with that version in it,
+    which is the only thing that tells the two apart from the outside: a folder
+    of the current format keeps its manifests one level down, and has none here.
+    A folder that answered yes is left untouched by everything here.
+    """
+    mpath = os.path.join(path, "manifest.json")
+    if not os.path.isfile(mpath):
+        return False
+    try:
+        with open(mpath, "r", encoding="utf-8") as fh:
+            return json.load(fh).get("version") == OLD_INDEX_VERSION
+    except (OSError, ValueError):
+        return False
+
+
+def _is_ours(path: str) -> bool:
+    """Whether this folder is a first-level cache folder of ours."""
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.is_dir() and os.path.isfile(
+                        os.path.join(e.path, "manifest.json")):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def drop_unfinished(parent: str, bases: Set[str]) -> int:
+    """
+    Removes, under one first-level folder, the second-level folders of the named
+    kinds that hold no manifest. Returns how many went.
+
+    A folder with no manifest is what an interrupted build leaves behind: the
+    folder is made before the features go in, so stopping leaves it empty or half
+    filled and nothing on disk names those features. Left alone it is not merely
+    untidy - it squats the name this run needs, so the folder that has to be
+    written there gets a number instead, and the run after that another number,
+    until the cache holds a staircase of folders differing only in their number
+    and holding nothing.
+
+    Only folders of the asked-for names are touched, and only where there is
+    nothing to keep: one with a manifest is somebody's index, whether this run
+    needs it or not.
+    """
+    dropped = 0
+    try:
+        with os.scandir(parent) as it:
+            names = [e.name for e in it if e.is_dir()]
+    except OSError:
+        return 0
+    for name in names:
+        if os.path.normcase(parse_level_name(name)) not in bases:
+            continue
+        path = os.path.join(parent, name)
+        if os.path.isfile(os.path.join(path, "manifest.json")):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        dropped += 1
+    return dropped
 
 
 # --------------------------------------------------------------------------- #

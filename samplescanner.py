@@ -106,7 +106,8 @@ from ssc.index import (CoarseIndex, CoarseCandidate, IndexPlan, SearchIndex,
 from ssc.inputs import (resolve_queries, resolve_source_records,
                         resolve_sources, top_folders)
 from ssc.paths import ensure_writable_dir
-from ssc.pitch import (fmt_semitones, normalise_pitch_args, parse_pitch_args)
+from ssc.pitch import (fmt_semitones, group_end, normalise_pitch_args,
+                       parse_pitch_args)
 from ssc.progress import INTERVAL, Progress
 from ssc.report import (Report, fit_name, name_column_width, print_report,
                         report)
@@ -680,6 +681,35 @@ def report_query(query: BatchQuery, index: SearchIndex, args,
           f"searches)")
     return best, query.computed, query.t_sum, query.errs
 
+def shifts_this_round(pitches: List[float], at: int, one_pass: bool,
+                      bundled: bool, order: str) -> range:
+    """
+    Which shifts one query is given in the round that starts at `at`, as a range
+    of indexes into the ordered shifts.
+
+    Three answers, and the difference between them is most of what a run costs:
+
+    * a plain round hands over one shift, so a confident one ends the query at
+      once and nothing past it is ever searched;
+    * a bundled round hands over everything left in the group `at` sits in -
+      one walk instead of one per shift, but still one group of fineness at a
+      time;
+    * a one-pass round hands over everything left whatever group it falls in,
+      because that is what --norounds and --nonlazy ask for.
+
+    The group is where a bundled round stops: with the finer order the
+    semitones are settled before the halves are looked at, which is the order
+    the groups exist for. With a step of 1 every shift is a whole semitone, so
+    there is a single group and a bundled round is the whole of the rest, as it
+    was before.
+    """
+    if one_pass:
+        return range(at, len(pitches))
+    if bundled:
+        return range(at, group_end(pitches, at, order))
+    return range(at, at + 1)
+
+
 def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
                 pitches: List[float], lazy: bool, run_dir: str,
                 unsure_dir: str, s_base: str, noted: Dict[str, bool]) -> None:
@@ -690,21 +720,33 @@ def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
     A ROUND is one walk that gives every query still in play its next shift.
     Queries that come back confident leave the batch - and are written down
     there and then, not at the end - so a later round answers fewer of them.
-    If a round leaves nearly everybody in play, it did not earn its walk and the
-    rest is bundled into a single pass.
+    If a round leaves nearly everybody in play, it did not earn its walk, and the
+    rest is bundled: one walk per group of pitches rather than one per shift.
+
+    Bundling stops at the end of the group. With the finer order the whole
+    semitones come first, so a round that found nothing at 0, ±1, ±2 says so
+    after the semitones and leaves the halves for the next walk - which is
+    where they belong, since a sample that is not at a whole semitone at all is
+    the rarer case, and one that IS there but hard to match is better found by
+    a walk over the halves than by a single walk over everything at once, which
+    only learns the same thing an hour later. With a step of 1, or with the
+    symm order, there is one group and this is the old bundling unchanged.
 
     --norounds asks for no rounds at all: one walk answers every remaining
     shift of every query of the batch. --nonlazy does the same on its own,
     because a query that is never allowed to stop gives a round nothing to
-    remove, and rounds would only add walks.
+    remove, and rounds would only add walks. Both of those are a request for
+    one walk over everything, so neither of them stops at a group.
     """
     one_pass = args.norounds or args.nonlazy
+    bundled = False
     alive = list(range(len(queries)))
     while alive:
         todo: List[Tuple[BatchQuery, Shift]] = []
         for i in alive:
             q = queries[i]
-            wanted = range(q.next, len(pitches)) if one_pass else (q.next,)
+            wanted = shifts_this_round(pitches, q.next, one_pass, bundled,
+                                      args.pitchorder)
             try:
                 for at in wanted:
                     sh = q.shift(pitches, args, at)
@@ -743,9 +785,11 @@ def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
         before = len(alive)
         alive = [i for i in alive if not queries[i].done]
         # a round that stopped almost nobody will not be followed by one that
-        # stops a lot: the rest is cheaper to compute in a single walk
+        # stops a lot: the rest is cheaper to compute in fewer walks - one per
+        # group of pitches, so that a query still gets its answer at the end of
+        # the semitones instead of at the end of everything
         if alive and (before - len(alive)) * ROUND_STOP_SHARE < before:
-            one_pass = True
+            bundled = True
 
 
 def sweep(queries: List[Tuple[str, Optional[np.ndarray]]],
@@ -1248,7 +1292,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # belongs in, whether the index already holds it, and how long it is.
         flash("Estimating size of index to build (or update)")
         coarse = CoarseIndex(s_base)
-        plan = coarse.plan(_index_files(s_base, names), top_of)
+        plan = coarse.plan(_index_files(s_base, names), top_of, jobs=args.jobs)
         for i, line in enumerate(format_plan(plan)):
             print(f"{'PLAN      :' if i == 0 else '            '}{line}")
         if not plan.fits:

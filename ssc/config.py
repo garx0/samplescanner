@@ -143,6 +143,20 @@ INDEX_BYTES_PER_SECOND = int((COARSE_BANDS * 2 + 4) * SAMPLE_RATE / COARSE_HOP)
 # Per file: the .npy headers, the manifest entry and the slack of the file
 # system. Small, but it is what keeps the estimate from going under.
 INDEX_BYTES_PER_FILE = 8 * 1024
+
+# What one frame of a cache file costs on disk: the bands as the coarse
+# features are stored, plus one float32 of frame energy. COUNTED and not
+# measured, because measuring means asking the disk about every file that
+# has just been written - and the number it is used for is how much a folder
+# has grown, which is the one thing a checkpoint has to decide on.
+COARSE_BYTES_PER_FRAME = (COARSE_BANDS * np.dtype(COARSE_DTYPE).itemsize
+                         + np.dtype(np.float32).itemsize)
+
+# How much a cache folder may gain before the manifest of the folder being
+# built is written again. One enormous folder of audio in a single folder is
+# hours of work with nothing to show for it if it is stopped near the end, and
+# a folder that never reaches this size never pays for a second write at all.
+COARSE_CHECKPOINT_BYTES = 100 * 1024 * 1024
 # Above this the index is worth a question before it is built. In the window
 # the user is asked; from a terminal it is only announced, because there is
 # nobody there to answer.

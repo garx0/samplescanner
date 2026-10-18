@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -17,6 +18,7 @@ from ssc import cache
 from ssc.audio import (audio_duration, list_audio_files, load_audio,
                        load_audio_many)
 from ssc.config import (BANK, BATCH_WINDOWS, COARSE_BANDS, COARSE_DTYPE,
+COARSE_BYTES_PER_FRAME, COARSE_CHECKPOINT_BYTES,
                         COARSE_HOP,
                         COARSE_MIN_FRAMES, COARSE_NFFT, COARSE_PER_MEMBER,
                         ENERGY_FLOOR, EPS, FINE_CANDIDATES, FINE_MAX_TOTAL,
@@ -187,11 +189,24 @@ class CoarseIndex:
         self._orphans: List[str] = []
         self._records: Dict[str, Dict[str, dict]] = {}
         self._by_name: Dict[str, CoarseEntry] = {}
+        # the cache folders this build brought into being, so that a checkpoint
+        # and the manifest written at the end are the same folder and not two
+        # copies of it
+        self._built: Dict[str, CacheFolder] = {}
+        # how much has been written under each folder since it was last recorded,
+        # which is what a checkpoint is decided on
+        self._since_flush: Dict[str, int] = {}
+        self._checkpoint_bytes = COARSE_CHECKPOINT_BYTES
+        self._warned = False
+        # the pool computes the files of a folder in several threads at once, and
+        # the counter and the manifest are both shared between them
+        self._lock = threading.Lock()
 
     # ---------- planning ----------
 
     def plan(self, files: Sequence[Tuple[str, int, float]],
-             top_of: Optional[Dict[str, str]] = None) -> IndexPlan:
+             top_of: Optional[Dict[str, str]] = None,
+             jobs: int = 0) -> IndexPlan:
         """
         What the index of these files WOULD cost, before anything is written:
         which cache folder each one belongs in, which of them are already there,
@@ -202,6 +217,15 @@ class CoarseIndex:
         slightly high: measured against real indexes it is about 5 % over,
         because the estimate cannot see the .npy headers and the slack of the
         file system.
+
+        Reading a length is one ffprobe process per file and about 60 ms of
+        waiting on it, so a collection of thirty-five thousand files spends half
+        an hour in this phase asking a question that the indexing itself then
+        answers by reading the same headers again, faster, in parallel. The
+        files are therefore measured in a pool of threads like the ones build()
+        uses, and on eight cores that takes about a quarter of the time. The
+        work waits on processes rather than on the interpreter, so the threads
+        do not queue behind each other the way they would for python work.
 
         `top_of` maps a file to the library folder it was picked through; the
         cache groups by that, so two packs that happen to share a folder name do
@@ -234,13 +258,28 @@ class CoarseIndex:
                 self._todo.setdefault(folder_path, []).append(lf)
                 self._missing.append(lf.path)
 
+        def measure(path: str) -> Tuple[str, Optional[float]]:
+            """The length of one file, or None when it cannot be read at all."""
+            try:
+                return path, audio_duration(path)
+            except (RuntimeError, OSError, ValueError):
+                return path, None
+
+        if len(self._missing) > 1 and jobs != 1:
+            with futures.ThreadPoolExecutor(
+                    max_workers=jobs if jobs > 0 else
+                    max(1, (os.cpu_count() or 2) - 1)) as pool:
+                measured = list(pool.map(measure, self._missing))
+        else:
+            measured = [measure(path) for path in self._missing]
+
         seconds = 0.0
         unknown: List[str] = []
-        for p in self._missing:
-            try:
-                seconds += audio_duration(p)
-            except (RuntimeError, OSError, ValueError):
-                unknown.append(p)
+        for path, length in measured:
+            if length is None:
+                unknown.append(path)
+            else:
+                seconds += length
         need = int(seconds * INDEX_BYTES_PER_SECOND
                    + len(self._missing) * INDEX_BYTES_PER_FILE)
         return IndexPlan(total=len(files), cached=self._cached,
@@ -291,6 +330,19 @@ class CoarseIndex:
                 done = self._compute(files, folder_path, jobs, bar)
                 fresh += len(done)
                 self._records.setdefault(folder_path, {}).update(done)
+                # The manifest of THIS folder goes down now, and not when the
+                # whole collection is done. On a large library that is hours, and
+                # a user who stops it and comes back tomorrow must not pay for
+                # today again: every folder already finished is a folder the next
+                # run finds in the cache and skips.
+                #
+                # What is written can only be true of this folder - all of its
+                # files are on the disk before save_folder is called - so nothing
+                # here risks the thing finish() was careful about, which is a
+                # manifest listing a file whose features were never written. A
+                # folder that stops half way is simply one with no manifest at
+                # all, which is what it was before any of this.
+                self._flush(folder_path)
         finally:
             bar.close()        # also when a file turned out to be unreadable
         return fresh, self._cached
@@ -313,6 +365,7 @@ class CoarseIndex:
             rec = {"bin": bin_name, "n_coarse": int(data.shape[0]),
                    "duration": float(len(data) * COARSE_HOP / SAMPLE_RATE),
                    "size": lf.size, "mtime": lf.mtime}
+            self._note(folder_path, lf.name, rec)
             bar.step()
             return lf.name, rec
 
@@ -327,37 +380,115 @@ class CoarseIndex:
 
     def finish(self) -> None:
         """
-        Writes the manifests and collects the entries for the search.
+        Collects the entries for the search, and writes out every manifest once
+        more.
 
-        Separate from build() because a manifest that lists a file whose features
-        were never written is a lie the next run would believe: what a folder
-        holds is recorded only once its features are all on disk.
+        build() already wrote each folder's manifest as the folder was finished;
+        this goes over all of them again, which costs one small file per folder
+        and buys two things. It is what writes the `source` of a folder that was
+        found rather than built - for a library folder that moved, that field is
+        how the cache learns where the library went, and a folder that was only
+        adopted never goes through build() at all. And it is what leaves a
+        consistent cache behind a run that found everything it needed and wrote
+        no features, where build() was never entered.
+
+        Writing a manifest that has not changed writes the same bytes, so the
+        second pass is bookkeeping rather than work.
         """
         assert self._layout is not None
         entries: List[CoarseEntry] = []
         self.bytes_on_disk = 0
-        for folder_path, in_folder in sorted(self._layout.files.items()):
-            cf = self._layout.folders.get(folder_path) or cache.CacheFolder(
-                path=folder_path, source=self._layout.source[folder_path])
-            # the source folder is written every time: for a folder that was
-            # moved it is how the cache learns where the library went
-            cf.source = self._layout.source[folder_path]
-            records = self._records.get(folder_path, {})
-            for name, lf in sorted(in_folder.items()):
-                rec = records.get(name)
-                if rec is None:
-                    continue
-                cf.entries[name] = rec
-                entries.append(CoarseEntry(
-                    name=self._report_name(lf.path), path=lf.path,
-                    bin=rec["bin"], dir=folder_path, src=name,
-                    n_coarse=int(rec["n_coarse"]),
-                    duration=float(rec["duration"]), size=lf.size,
-                    mtime=lf.mtime))
-            cache.save_folder(cf)
+        for folder_path in sorted(self._layout.files):
+            entries.extend(self._flush(folder_path))
             self.bytes_on_disk += _folder_bytes(folder_path)
         self.entries = entries
         self._by_name = {e.name: e for e in entries}
+
+    def _note(self, folder_path: str, name: str, rec: dict) -> None:
+        """
+        Records one finished file, and writes the folder's manifest if enough of
+        it has been written since the last time.
+
+        This is what makes one enormous folder survivable. Its manifest is written
+        when the folder is finished, and that can be hours away: a folder of
+        albums lying loose in one directory is hours of work, and stopping it near
+        the end used to throw away everything before the last write. Now the
+        progress is on disk every hundred megabytes of features, and the next run
+        builds what is left of it.
+
+        The number that decides it is the frames just computed times what a frame
+        costs on disk - both of which are already known here, so nothing is asked
+        of the disk and nothing is measured afterwards. Adding the length of one
+        file to a counter that is reset each time it is used is the whole of the
+        bookkeeping.
+
+        It is all under one lock, because the pool is several threads and two of
+        them reaching the threshold together would write the same manifest twice,
+        the second time naming less than the first.
+        """
+        with self._lock:
+            self._records.setdefault(folder_path, {})[name] = rec
+            grown = (self._since_flush.get(folder_path, 0)
+                     + rec["n_coarse"] * COARSE_BYTES_PER_FRAME)
+            if grown < self._checkpoint_bytes:
+                self._since_flush[folder_path] = grown
+                return
+            try:
+                self._flush(folder_path, unfinished=True)
+            except OSError as exc:
+                # A checkpoint is the one thing here that must not stop a build.
+                # The folder is still being written to either way, and the
+                # manifest at the end of it will name all of it; what is lost is
+                # this one window of progress, which is exactly what the
+                # checkpoint was there to keep. The counter is left where it is,
+                # so the next file tries again rather than waiting a whole
+                # hundred megabytes for permission that may not have changed.
+                if not self._warned:
+                    self._warned = True
+                    print(f"  WARNING: the manifest of "
+                          f"{os.path.basename(folder_path)} could not be written "
+                          f"yet — {exc}. Building continues; the manifest is "
+                          f"written when the folder is done.", flush=True)
+                return
+            self._since_flush[folder_path] = 0
+
+    def _flush(self, folder_path: str,
+               unfinished: bool = False) -> List[CoarseEntry]:
+        """
+        Writes one cache folder's manifest, and returns the entries it holds.
+
+        Only files whose features are on the disk are written down, so a file that
+        could not be decoded - or a folder interrupted before it was done - is
+        never named in a manifest. That is the whole of what a manifest promises:
+        that the .npy of everything it lists is there. Reading it back checks the
+        other half of the promise too (see plan()).
+
+        `unfinished` is for a manifest written halfway through a folder that is
+        still being built; see save_folder for why it is there and why nothing
+        reads it.
+        """
+        in_folder = self._layout.files[folder_path]
+        cf = self._layout.folders.get(folder_path) or self._built.setdefault(
+            folder_path, cache.CacheFolder(
+                path=folder_path, source=self._layout.source[folder_path]))
+        # the source folder is written every time: for a folder that was moved it
+        # is how the cache learns where the library went
+        cf.source = self._layout.source[folder_path]
+        records = self._records.get(folder_path, {})
+        out: List[CoarseEntry] = []
+        for name, lf in sorted(in_folder.items()):
+            rec = records.get(name)
+            if rec is None:
+                continue
+            cf.entries[name] = rec
+            out.append(CoarseEntry(
+                name=self._report_name(lf.path), path=lf.path,
+                bin=rec["bin"], dir=folder_path, src=name,
+                n_coarse=int(rec["n_coarse"]),
+                duration=float(rec["duration"]), size=lf.size,
+                mtime=lf.mtime))
+        cache.save_folder(cf, unfinished=unfinished)
+        return out
 
     def _report_name(self, path: str) -> str:
         """How a file is named in the report and in the fragments: as the user

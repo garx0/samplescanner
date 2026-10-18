@@ -1188,7 +1188,20 @@ class SearchDialog(tk.Toplevel):
 
 
 class CacheWindow(tk.Toplevel):
-    """Shows what the cache holds and how much of it is worth deleting."""
+    """
+    Shows what the cache holds and how much of it is worth deleting.
+
+    Counting it means a stat of every file in it, and the cache of a large library
+    is hundreds of thousands of files: on a spinning disk or a network share that
+    is not a moment but a minute or more. Doing it on the thread that draws the
+    window is what made this window look frozen, and it was the one place in the
+    program where a user could not get at their own cache - so the walk and the
+    removal are both done in worker threads, and the window says what it is
+    waiting for instead of sitting there looking broken.
+
+    The lines come back through a queue rather than being written by the thread,
+    because tkinter may only be touched from the thread it was started in.
+    """
 
     def __init__(self, master, work_dir):
         super().__init__(master)
@@ -1196,6 +1209,11 @@ class CacheWindow(tk.Toplevel):
         self.title("Cache")
         self.geometry("760x430")
         self.transient(master)
+        self.rows: list = []           # what the list shows, so deleting need
+        self.busy = False              # not walk the whole cache a second time
+        self.queue: queue.Queue = queue.Queue()
+        self.alive = True
+        self.note = ""                 # what to add under the next listing
 
         wrap = ttk.Frame(self, padding=8)
         wrap.pack(fill=tk.BOTH, expand=True)
@@ -1213,22 +1231,30 @@ class CacheWindow(tk.Toplevel):
 
         bar = ttk.Frame(self, padding=(8, 4, 8, 8))
         bar.pack(fill=tk.X)
-        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Delete the selected",
-                   command=self.delete_selected).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bar, text="Delete all", command=self.delete_all).pack(
-            side=tk.LEFT)
+        self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
+        self.refresh_btn.pack(side=tk.LEFT)
+        self.sel_btn = ttk.Button(bar, text="Delete the selected",
+                                  command=self.delete_selected)
+        self.sel_btn.pack(side=tk.LEFT, padx=4)
+        self.all_btn = ttk.Button(bar, text="Delete all", command=self.delete_all)
+        self.all_btn.pack(side=tk.LEFT)
         ttk.Button(bar, text="Open the cache folder",
                    command=lambda: open_in_explorer(self.cache_dir())).pack(
             side=tk.RIGHT)
         self.bind("<Delete>", lambda e: self.delete_selected())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.after(80, self._poll)
         self.refresh()
 
     def cache_dir(self):
         return os.path.join(self.work_dir.get(), "cache")
 
     def folders(self):
-        """One line per collection: size, file count, when it was last used."""
+        """One line per collection: size, file count, when it was last used.
+
+        Touches nothing but the disk, and only reads it - which is what lets it
+        run in a worker thread.
+        """
         base = self.cache_dir()
         if not os.path.isdir(base):
             return []
@@ -1249,25 +1275,101 @@ class CacheWindow(tk.Toplevel):
                     count += 1
                     newest = max(newest, st.st_mtime)
             when = time.strftime("%d.%m.%Y %H:%M",
-                                 time.localtime(newest)) if newest else "—"
+                                 time.localtime(newest)) if newest else "-"
             out.append((name, size, count, when, path))
         return out
 
-    def refresh(self):
-        self.listbox.delete(0, tk.END)
-        rows = self.folders()
-        for name, size, count, when, _p in rows:
-            self.listbox.insert(tk.END, f"{name:<28} {fmt_size(size):>10}   "
-                                        f"{count:>5} files   {when}")
-        if not rows:
-            self.summary.set(f"{self.cache_dir()} does not exist yet — the "
-                             f"cache appears after the first search.")
+    # ---------- the worker ----------
+
+    def _set_busy(self, busy: bool):
+        """Greyed out while something is being counted or removed: a second
+        request would ask the worker to do the same walk twice."""
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in (self.refresh_btn, self.sel_btn, self.all_btn):
+            btn.configure(state=state)
+
+    def _start(self, what: str, work, *args):
+        self._set_busy(True)
+        self.summary.set(what)
+        threading.Thread(target=self._run, args=(work, args),
+                         daemon=True).start()
+
+    def _run(self, work, args):
+        try:
+            self.queue.put((work.__name__, work(*args)))
+        except Exception as exc:                     # noqa: BLE001 - reported
+            self.queue.put((work.__name__, exc))
+
+    def _poll(self):
+        if not self.alive:
+            return                     # closed while a worker was still running
+        try:
+            what, payload = self.queue.get_nowait()
+        except queue.Empty:
+            pass
         else:
-            self.summary.set(
-                f"{len(rows)} collection(s), {fmt_size(sum(r[1] for r in rows))}"
-                f" total. Tick the ones to remove with Ctrl or Shift. "
-                f"Deleting costs time, not data: the index of a collection is "
-                f"built again at its next search.")
+            self._show(what, payload)
+            self._set_busy(False)
+            if what == "_remove":
+                # the list still holds the folders that were just deleted, so
+                # the counting starts again by itself rather than leaving the
+                # window showing something that is no longer there
+                self.refresh()
+        try:
+            self.after(120, self._poll)
+        except tk.TclError:            # closed between the check and the call
+            self.alive = False
+
+    def _show(self, what: str, payload):
+        if isinstance(payload, Exception):
+            what_happened = ("The cache could not be read"
+                             if what == "_count"
+                             else "The folders could not be deleted")
+            self.summary.set(f"{what_happened}: {payload}")
+            return
+        if what == "_count":
+            self.rows = payload
+            self.listbox.delete(0, tk.END)
+            for name, size, count, when, _p in payload:
+                self.listbox.insert(tk.END, f"{name:<28} {fmt_size(size):>10}"
+                                            f"   {count:>5} files   {when}")
+            if not payload:
+                text = (f"{self.cache_dir()} does not exist yet - the "
+                        f"cache appears after the first search.")
+            else:
+                total = sum(r[1] for r in payload)
+                text = (f"{len(payload)} collection(s), {fmt_size(total)} total. "
+                        f"Tick the ones to remove with Ctrl or Shift. "
+                        f"Deleting costs time, not data: the index of a "
+                        f"collection is built again at its next search.")
+            self.summary.set(f"{text}  {self.note}".strip() if self.note else text)
+            self.note = ""
+        elif what == "_remove":
+            # kept for under the listing that follows it, rather than shown for a
+            # moment and then counted over
+            self.note = (f"Deleted {len(payload)} folder(s). If Explorer will "
+                         f"not let you delete one by hand, see the note in "
+                         f"README_all.md about running the program as "
+                         f"administrator.")
+
+    def refresh(self):
+        if self.busy:
+            return
+        self._start("Counting the cache - a large one takes a while...",
+                    self._count)
+
+    def _count(self):
+        return self.folders()
+
+    def _remove(self, rows):
+        gone = []
+        for _n, _s, _c, _w, path in rows:
+            shutil.rmtree(path, ignore_errors=True)
+            gone.append(path)
+        return gone
+
+    # ---------- deleting ----------
 
     def _delete(self, rows):
         if not rows:
@@ -1279,21 +1381,22 @@ class CacheWindow(tk.Toplevel):
         total = sum(r[1] for r in rows)
         if not messagebox.askyesno(
                 "Delete from the cache?",
-                f"{what}\n\n{total and fmt_size(total)} will be freed. The "
-                f"next search over them is slower — the index is built again. "
+                f"{what}\n\n{fmt_size(total)} will be freed. The "
+                f"next search over them is slower - the index is built again. "
                 f"\n\nDelete?", parent=self):
             return
-        for _n, _s, _c, _w, path in rows:
-            shutil.rmtree(path, ignore_errors=True)
-        self.refresh()
+        self._start("Deleting...", self._remove, rows)
 
     def delete_selected(self):
-        rows = self.folders()
-        self._delete([rows[i] for i in self.listbox.curselection()
-                      if 0 <= i < len(rows)])
+        self._delete([self.rows[i] for i in self.listbox.curselection()
+                      if 0 <= i < len(self.rows)])
 
     def delete_all(self):
-        self._delete(self.folders())
+        self._delete(list(self.rows))
+
+    def destroy(self):
+        self.alive = False
+        super().destroy()
 
 
 # --------------------------------------------------------------------------- #

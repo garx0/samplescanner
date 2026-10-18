@@ -132,6 +132,33 @@ def order_pitches(values: Sequence[float], order: str = "finer") -> List[float]:
     return sorted(values, key=lambda v: (_fineness(v), abs(v), -v))
 
 
+def group_end(pitches: Sequence[float], at: int,
+              order: str = "finer") -> int:
+    """
+    The index one past the last shift of the group that pitches[at] sits in -
+    the very groups describe_pitch_order prints: one per level of fineness for
+    "finer", the whole list for "symm".
+
+    This is what turns "every shift that is left" into "every shift that is
+    left in this group". The order the finer order sorts by puts the levels of
+    fineness next to each other and in one piece each, so a run of equal
+    fineness is a group, and with a step of 1 every shift is on level zero: one
+    group covering all of them, which leaves the caller with what it had.
+
+    Ordered, but not assumed to be: a list that was never through
+    order_pitches would have the levels scattered, and the answer would then be
+    the first run rather than the group. The search only ever hands over an
+    ordered list, which is why this walks instead of counting.
+    """
+    if at < 0 or at >= len(pitches) or order != "finer":
+        return len(pitches)
+    level = _fineness(pitches[at])
+    end = at + 1
+    while end < len(pitches) and _fineness(pitches[end]) == level:
+        end += 1
+    return end
+
+
 def describe_pitch_set(low: float, high: float,
                        step: float = 1.0) -> str:
     """

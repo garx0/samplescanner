@@ -23,7 +23,7 @@ from __future__ import annotations
 # --------------------------------------------------------------------------- #
 # CHANGE THIS LINE — and only this line — when the program gets a new version
 # --------------------------------------------------------------------------- #
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 # The name it is distributed under. Not part of the number, but it belongs to the
 # same question, so it is answered here too.
