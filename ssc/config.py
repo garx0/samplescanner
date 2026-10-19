@@ -171,12 +171,15 @@ INDEX_SIZE_WARN = 2 * 1024 ** 3
 DEFAULT_RESULTS_PREFIX = "results"
 DEFAULT_UNSURE_SUBDIR = "unsure"
 # How many queries one pass over the collection answers. Making a file ready to
-# be compared with something costs the same whatever is compared with it, so
-# the more queries share the pass the less of that work there is per query.
-# Four is a compromise: the search gets quicker with every step, but the report
-# of a query is printed only when the last query of its batch is done, and that
-# wait grows with the batch.
-DEFAULT_BATCH = 4
+# be compared with something costs the same whatever is compared with it, so the
+# more queries share the pass the less of that work there is per query - and the
+# more of it the user waits without hearing anything, because the report of a
+# query is printed only when the last query of its batch is done.
+#
+# One is that compromise, and it is the default: a search that says what it found
+# as it finds it is worth more than the few per cent a bigger batch saves, and a
+# single query is what most people run at a time anyway. --batch raises it.
+DEFAULT_BATCH = 1
 # The sweep goes through the collection in rounds: one walk gives every query
 # still in play its next shift, and the queries that come back confident leave.
 # A round that stops less than a 1/ROUND_STOP_SHARE of them is not worth its

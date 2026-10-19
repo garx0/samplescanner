@@ -187,7 +187,8 @@ def export_match(query_name: str, source_rel: str, source_path: str,
 def export_report(rep: Report, run_dir: str, unsure_dir: str,
                   export_enabled: bool, search_folder: str,
                   unsure_min_sim: float,
-                  dest_override: Optional[str] = None) -> float:
+                  dest_override: Optional[str] = None,
+                  quiet: bool = False) -> float:
     """
     Writes the fragments of one report and prints what was written. Returns the
     time it took.
@@ -200,6 +201,12 @@ def export_report(rep: Report, run_dir: str, unsure_dir: str,
     `dest_override` puts them in that folder instead, wherever they would
     normally go: it is how a match found half way through a sweep is written
     down before the sweep is over (see INTERMEDIATE_SUBDIR).
+
+    `quiet` writes the files without naming them on the screen. A caller that is
+    showing what it found as it goes marks the row of the shift instead, and the
+    names are still kept on the report, so the verdict still says where they
+    went — printing them here as well would put each path on the screen twice
+    and push the table of shifts it belongs to out of sight.
     """
     t_one = time.perf_counter()
     if not export_enabled:
@@ -210,8 +217,9 @@ def export_report(rep: Report, run_dir: str, unsure_dir: str,
         dest_dir = dest_override or unsure_dir
         note = f"  [uncertain — {rep.export_reason}]"
     else:
-        print(f"  FRAGMENT: not exported — {rep.export_reason} "
-              f"(below --unsure-min-sim {unsure_min_sim:.2f})")
+        if not quiet:
+            print(f"  FRAGMENT: not exported — {rep.export_reason} "
+                  f"(below --unsure-min-sim {unsure_min_sim:.2f})")
         return time.perf_counter() - t_one
 
     hits = rep.hits or [Hit(rep.best.file_name, rep.offset,
@@ -228,15 +236,16 @@ def export_report(rep: Report, run_dir: str, unsure_dir: str,
                 pitch=rep.pitch)
             done.append((saved, hit))
         except (RuntimeError, OSError) as exc:
-            print(f"  FRAGMENT: could not save {hit.file_name} ({exc})")
-    if len(done) > 1:
+            if not quiet:
+                print(f"  FRAGMENT: could not save {hit.file_name} ({exc})")
+    if len(done) > 1 and not quiet:
         print(f"  FRAGMENT: {len(done)} equivalent sources exported:")
-    print_saved(rep, done, note)
+    print_saved(rep, done, note, quiet)
     return time.perf_counter() - t_one
 
 
 def print_saved(rep: Report, done: List[Tuple[List[str], Hit]],
-                note: str) -> None:
+                note: str, quiet: bool = False) -> None:
     """
     Names the fragments that were written, the corrected ones only.
 
@@ -264,8 +273,9 @@ def print_saved(rep: Report, done: List[Tuple[List[str], Hit]],
                 tag = ""
             lines.append(f"            {_shown_path(path)}{tag}"
                          f"{note if hit is done[0][1] and i == 0 else ''}")
-    for line in lines:
-        print(line)
+    if not quiet:
+        for line in lines:
+            print(line)
     rep.exported_lines = lines
 
 

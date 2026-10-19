@@ -93,6 +93,30 @@ PITCH_MIN, PITCH_MAX = -24, 24
 PITCH_STEPS = ("1", "0.5", "0.25", "0.125", "0.0625")
 PITCH_ORDERS = ("finer", "symm")      # "finer" tries whole semitones first
 
+# The checkbox that stands for the order which bundles the walks, under the name
+# and with the explanation of whichever order it is offering. Keyed by whether
+# --nonlazy is on: with it off there are three orders and this is `dynamic`,
+# with it on `dynamic` IS `all` and the box simply says so.
+#
+# The two explanations are the same words today. They are held apart anyway,
+# because the day they are not this is the only place that changes.
+BUNDLE_LABEL = {False: "Enable dynamic pitch batches",
+                True: "Enable pitch batches"}
+BUNDLE_TIP = {False:
+              "Off = updates results as frequently as possible, but usually "
+              "slower to complete the whole search (could be faster though if "
+              "the samples are present in the collection at one of the first "
+              "checked pitches).\n"
+              "On = might update results less frequently, but usually "
+              "completes the whole seach faster.",
+              True:
+              "Off = updates results as frequently as possible, but usually "
+              "slower to complete the whole search (could be faster though if "
+              "the samples are present in the collection at one of the first "
+              "checked pitches).\n"
+              "On = might update results less frequently, but usually "
+              "completes the whole seach faster."}
+
 # How wide a line of the hint under a picker may grow. What may be picked is a
 # whole paragraph, so it goes under the title and wraps instead of running off
 # the edge of a narrow screen. It has to stay well under the 780 pixels
@@ -183,6 +207,13 @@ date: everything picked is in it as it is, a text list included.
 
 Everything typed in the "extra options" field goes into the command line as it
 is, for anything that has no field of its own.
+
+The search shows what it has found as it finds it: with one query at a time the
+table of pitches searched is printed after every pitch. Ticking "I'm going AFK"
+folds away two options that trade that for finishing sooner - a bigger batch of
+queries per pass, and the pitches of the rest bundled together once the searches
+are not coming back early anyway. Unticked, they are not passed to the program
+at all, because they are its defaults.
 
 The window that opens streams the full report of the search; it can be
 stopped, saved and scrolled. The line VERDICT says how convincing the answer
@@ -379,6 +410,58 @@ def show_argv(argv: list) -> str:
         return subprocess.list2cmdline(argv)
     import shlex
     return shlex.join(argv)
+
+
+def without_picks(argv: list) -> list:
+    """
+    The command with `-q` and `-s` taken out, and everything after them: the
+    switches themselves and the paths that follow, since a preview showing
+    `-q` with nothing after it is worse than one that never mentioned it.
+
+    Both take any number of items, so there is no counting: the values of one
+    run until a token that begins with a dash, which is where the next option
+    starts.
+    """
+    out: list = []
+    skipping = False
+    for arg in argv:
+        if skipping:
+            if not arg.startswith("-"):
+                continue
+            skipping = False
+        if arg in ("-q", "--query", "-s", "--search"):
+            skipping = True
+            continue
+        out.append(arg)
+    return out
+
+
+def preview_argv(argv: list, width: int = 76) -> str:
+    """
+    The command as a person would type it, for the preview under the form:
+    wrapped over as many lines as it needs, and without the picked items.
+
+    The picks are left out on purpose. Someone who selects forty files gets a
+    line of paths forty names long, and every option after it is pushed off the
+    right edge of the window — which is exactly the part the preview exists to
+    show. What is left is short, and what is left is what the form decides.
+
+    Only the preview is treated this way: the line at the top of the run window
+    is the command as it is run, whole and copyable.
+    """
+    lines: list = []
+    current = ""
+    for arg in without_picks(argv):
+        if not current:
+            current = arg
+        elif len(current) + 1 + len(arg) <= width:
+            current += " " + arg
+        else:
+            lines.append(current)
+            current = arg
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
 
 
 def elide_path(path: str, limit: int = 56) -> str:
@@ -625,7 +708,10 @@ class RunWindow(tk.Toplevel):
         self.stop_btn.configure(state="disabled")
         secs = time.perf_counter() - getattr(self, "t0", time.perf_counter())
         self._put("")
-        self.status.set(f"finished in {secs:.1f} s"
+        # the same form the program itself writes a time in, so that a number
+        # here and a number in the log beside it are written one way: "50s",
+        # "4m2s", "1h55m20s", "0.01s"
+        self.status.set(f"finished in {fmt_elapsed(secs)}"
                         + (f", exit code {code}" if code else ""))
         if self.results_dir:
             self._put(f"\nThe fragments are in {self.results_dir}",
@@ -1010,28 +1096,71 @@ class SearchDialog(tk.Toplevel):
         self.nonlazy = tk.BooleanVar()
         self.noexport = tk.BooleanVar()
         self.batch = tk.IntVar(value=DEFAULT_BATCH)
+        self.afk = tk.BooleanVar()
+        # the second walking order, under whichever name it is being offered
+        self.bundled = tk.BooleanVar()
 
-        # How the library is walked is two decisions, and what each of them
-        # costs is more than fits here: both hang off the small "?" and come on
+        # How the collection is walked is three decisions, and what each of them
+        # costs is more than fits here: they hang off the small "?" and come on
         # hover - the control itself answers to the pointer as well.
-        batch_row = ttk.Frame(opts)
-        batch_row.grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(batch_row, text="Batch size:").pack(side=tk.LEFT)
+        #
+        # Two of them only exist for someone who is leaving the machine alone,
+        # so they stay folded away until the checkbox above them is ticked. A
+        # search started without them says what it found as it finds it, which
+        # is what a person sitting in front of the screen wants; the ones for
+        # walking away trade that for finishing sooner.
+        afk_row = ttk.Frame(opts)
+        afk_row.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.afk_check = ttk.Checkbutton(
+            afk_row, variable=self.afk, command=self._toggle_afk,
+            text="I'm going AFK and want the search to finish faster but "
+                 "update the intermediate results less frequently")
+        self.afk_check.pack(side=tk.LEFT)
+
+        self.batch_row = ttk.Frame(opts)
+        self.batch_row.grid(row=1, column=0, columnspan=2, sticky="w",
+                            pady=(6, 0))
+        ttk.Label(self.batch_row, text="Number of queries in batch:").pack(
+            side=tk.LEFT)
         self.batch_spin = ttk.Spinbox(
-            batch_row, from_=1, to=99, width=5, textvariable=self.batch,
+            self.batch_row, from_=1, to=99, width=5, textvariable=self.batch,
             command=self._refresh_cmdline)
         self.batch_spin.pack(side=tk.LEFT, padx=(4, 0))
-        mark = tip_mark(batch_row)
+        mark = tip_mark(self.batch_row)
         mark.pack(side=tk.LEFT, padx=(2, 0))
-        Tip([batch_row, self.batch_spin, mark],
+        Tip([self.batch_row, self.batch_spin, mark],
             "Process queries in batches. Runs faster in total, but intermediate "
-            "results report will be updated less often (you'll see results "
-            "for individual queries only after the whole batch is processed).")
+            "results report will be updated less frequently (you'll see results "
+            "for individual queries only after the whole batch is processed). To "
+            "monitor all results (both weak and confident) for each pitch in "
+            "real time, set to 1, and uncheck Enable dynamic pitch batches "
+            "option")
+
+        # The one box that stands for "the order that bundles the walks", named
+        # for whichever of the two orders it is offering at the moment. With lazy
+        # stopping on there are three orders and this is `dynamic`: bundling only
+        # once the rounds stop paying. With --nonlazy the cap it would wait for
+        # never has anything to notice, so `dynamic` is the `all` order already,
+        # and what is worth asking about becomes simply whether to bundle at
+        # all. Same box, same state, different word - and the two explanations
+        # are the same text today, kept in one place so that the day they are
+        # not, only this constant has to change.
+        self.dyn_row = ttk.Frame(opts)
+        self.dyn_row.grid(row=2, column=0, columnspan=2, sticky="w",
+                          pady=(6, 0))
+        self.dyn_check = ttk.Checkbutton(
+            self.dyn_row, variable=self.bundled,
+            text=BUNDLE_LABEL[False], command=self._refresh_cmdline)
+        self.dyn_check.pack(side=tk.LEFT)
+        mark = tip_mark(self.dyn_row)
+        mark.pack(side=tk.LEFT, padx=(2, 0))
+        self.dyn_tip = Tip([self.dyn_row, self.dyn_check, mark],
+                           BUNDLE_TIP[False])
 
         lazy_row = ttk.Frame(opts)
-        lazy_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        lazy_row.grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.lazymode = ttk.Checkbutton(
-            lazy_row,
+            lazy_row, command=self._toggle_afk,
             text="Non-lazy mode: try every pitch shift, even after a "
                  "confident one", variable=self.nonlazy)
         self.lazymode.pack(side=tk.LEFT)
@@ -1040,15 +1169,18 @@ class SearchDialog(tk.Toplevel):
         Tip([self.lazymode, lazy_row, mark],
             "Processes more pitches but isn't actually that much slower "
             "(could even be faster)")
-        ttk.Checkbutton(opts, text="do not cut the fragments to files",
-                        variable=self.noexport).grid(row=1, column=1,
-                                                      sticky="w", pady=(6, 0))
+        noexport_row = ttk.Frame(opts)
+        noexport_row.grid(row=3, column=1, sticky="w", pady=(6, 0))
+        self.noexport_check = ttk.Checkbutton(
+            noexport_row, command=self._refresh_cmdline,
+            text="do not cut the fragments to files", variable=self.noexport)
+        self.noexport_check.pack(side=tk.LEFT)
         opts.columnconfigure(1, weight=1)
 
-        ttk.Label(opts, text="extra options:").grid(row=2, column=0, sticky="w",
+        ttk.Label(opts, text="extra options:").grid(row=4, column=0, sticky="w",
                                                     pady=(6, 0))
         self.extra = ttk.Entry(opts, font=(MONO, 9))
-        self.extra.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(6, 0))
+        self.extra.grid(row=4, column=1, sticky="ew", pady=(6, 0), padx=(6, 0))
 
         bottom = ttk.Frame(self, padding=(8, 8, 8, 8))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1063,9 +1195,34 @@ class SearchDialog(tk.Toplevel):
         ttk.Button(btns, text="Cancel",
                    command=self.destroy).pack(side=tk.RIGHT, padx=6)
 
+        self._toggle_afk()
         self._update_pitch()
         self.bind("<Return>", lambda e: self.start())
         self._fit_to_screen()
+
+    def _toggle_afk(self):
+        """
+        Folds the two walking options away unless the box above them says the
+        person is leaving the machine alone, renames the second of them to suit
+        the order it is offering at the moment, and rebuilds the command line
+        either way - what the search runs with is not the same command as the one
+        it ran with a moment ago.
+        """
+        afk = self.afk.get()
+        nonlazy = self.nonlazy.get()
+        self._pack_row(self.batch_row, afk)
+        self._pack_row(self.dyn_row, afk)
+        self.dyn_check.configure(text=BUNDLE_LABEL[nonlazy])
+        self.dyn_tip.text = BUNDLE_TIP[nonlazy]
+        self._refresh_cmdline()
+
+    @staticmethod
+    def _pack_row(row, packed: bool):
+        """A row that is out of the way takes no space at all, not none it sees."""
+        if packed:
+            row.grid()
+        else:
+            row.grid_remove()
 
     def _fit_to_screen(self):
         """
@@ -1129,8 +1286,13 @@ class SearchDialog(tk.Toplevel):
         the only place the person can see what the picked items turn into — in
         particular that a .txt list is handed over as it is, whole, and not
         opened here.
+
+        The picks are not in it (see preview_argv) and it takes as many lines as
+        it needs, so the window is resized to fit: a preview that pushes its own
+        options out of sight has stopped saying what it is for.
         """
-        self.cmdline.set(show_argv(self.build_argv()))
+        self.cmdline.set(preview_argv(self.build_argv()))
+        self._fit_to_screen()
 
     def build_argv(self):
         lo, hi, step = self.pitch_range()
@@ -1140,7 +1302,21 @@ class SearchDialog(tk.Toplevel):
         argv.append(f"--pitchorder={self.order.get()}")
         if self.nonlazy.get():
             argv.append("--nonlazy")
-        argv.append(f"--batch={max(1, self.batch.get())}")
+        # Neither of the two walking options is passed on unless the person
+        # said they are leaving the machine alone: with the box off, single
+        # shifts at a batch of one is already the default, so saying it would
+        # only make the command line under the form longer than the search it
+        # describes.
+        #
+        # The second box is the order that bundles the walks, and which of the
+        # two that is depends on non-lazy: `dynamic` with lazy stopping on, `all`
+        # with it off - where `dynamic` would be `all` anyway, since nothing
+        # ever finishes early for its cap to notice.
+        if self.afk.get():
+            argv.append(f"--batch={max(1, self.batch.get())}")
+            if self.bundled.get():
+                argv.append("--pitchbatch=all" if self.nonlazy.get()
+                            else "--pitchbatch=dynamic")
         if self.noexport.get():
             argv.append("--no-export")
         # the program must ask before it spends gigabytes on the disk, and the

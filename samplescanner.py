@@ -345,7 +345,7 @@ def walk_shifts(shifts: List[Shift], index: SearchIndex, args,
     if args.progress_interval >= 0:
         bar = Progress(len(index.coarse.entries), interval=args.progress_interval,
                        text=f"{SCAN_BAR_MARK} LIBRARY for current {whose} with "
-                            f"pitches {pitch_text} st").start()
+                            f"pitch(es) {pitch_text} st").start()
     # the bar of the walk is closed by the walk itself, not here: what it says
     # about its own time and rate has to be the walking, and this function does
     # not return until the precise pass is over as well. It is dropped once
@@ -392,7 +392,7 @@ def scan_note(count: int, pitches: List[float]) -> str:
 
 def report_intermediate(query: BatchQuery, index: SearchIndex, args,
                         run_dir: str, unsure_dir: str, s_base: str,
-                        noted: Dict[str, bool]) -> None:
+                        noted: Dict[str, bool], quiet: bool = False) -> None:
     """
     A confident match, the moment it is found rather than at the end of the
     sweep: said in one line, and cut out straight away. A search of a large
@@ -410,6 +410,12 @@ def report_intermediate(query: BatchQuery, index: SearchIndex, args,
 
     The shift that is saved is the one that was found, not the best of the whole
     sweep - that one is still to come, and may well be elsewhere.
+
+    `quiet` cuts the files out without a word on the screen. A caller showing
+    what it found as it goes says so on the row of the shift instead, and the
+    names are kept on the report so the verdict still says where they went -
+    printed here as well, they would put every path on the screen twice and push
+    the table of shifts out of sight.
     """
     rep = query.best
     flash(f"FOUND    : {os.path.basename(query.label)} -> "
@@ -429,7 +435,7 @@ def report_intermediate(query: BatchQuery, index: SearchIndex, args,
     # said once for the whole run, not over every result: it introduces the
     # block of file names below it, and a line repeating itself in front of
     # each of them reads as three separate things having happened
-    if not noted.get("header"):
+    if not quiet and not noted.get("header"):
         noted["header"] = True
         print(f"  {header}")
     # the cut itself is ffmpeg work, one call per exported source, and it is the
@@ -438,7 +444,7 @@ def report_intermediate(query: BatchQuery, index: SearchIndex, args,
     flash(f"cutting the fragments of {os.path.basename(query.label)} "
           f"(in advance)")
     export_report(rep, run_dir, unsure_dir, True, s_base, args.unsure_min_sim,
-                  dest_override=dest)
+                  dest_override=dest, quiet=quiet)
     query.exported_report = rep
     query.exported_final = dest == run_dir
 
@@ -477,8 +483,8 @@ class BatchQuery:
     """
     __slots__ = ("label", "x", "shifts", "next", "best", "swept", "done",
                  "stopped_at", "found_confident", "told", "exported_report",
-                 "exported_final", "name_w", "entries", "errs", "computed",
-                 "t_sum")
+                 "exported_final", "name_w", "entries", "head", "rows",
+                 "cut_row", "shown_live", "errs", "computed", "t_sum")
 
     def __init__(self, label: str, x: np.ndarray) -> None:
         self.label = label
@@ -501,6 +507,18 @@ class BatchQuery:
         self.name_w = 0
         # (the shift came through, what it has to say) for every shift tried
         self.entries: List[Tuple[bool, List[str]]] = []
+        # the heading of that table and one line per shift, kept out of
+        # `entries` so that a search showing its shifts as it goes can print the
+        # heading once and the newest line, without carrying the rest along
+        self.head: List[str] = []
+        self.rows: List[str] = []
+        # which row is the one whose fragment has been cut out already, -1 while
+        # none has: the caller that shows the rows as it goes says so on that
+        # one, instead of printing a block of file names over the table
+        self.cut_row = -1
+        # whether this table has already been printed row by row as the shifts
+        # were searched, so that the report does not print it a second time
+        self.shown_live = False
         self.errs: List[Tuple[str, str]] = []
         self.computed = 0
         self.t_sum = 0.0
@@ -579,6 +597,10 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
         left = (f"    {'pitch':>6}  {'source':<{query.name_w}s} "
                 f"{'position':>9}  ")
         lines.append(f"{left}{'time spent':>10}  {'r':>6}  {'frames':>6}")
+        # the heading of the whole table, both of its lines, taken before the row
+        # for this shift goes on the end of `lines` - a search that shows its
+        # shifts as it goes prints this once, above the first of them
+        query.head = list(lines)
     name = fit_name(rep.best.file_name, query.name_w)
     w = query.name_w
     # the pass that answered this shift answered every pair of query and pitch it
@@ -587,12 +609,14 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
     # read against another run: a batch of fifteen queries and a single query do
     # not take the same time for a shift, and saying so under the header instead
     # of dividing is what made the column unreadable
-    lines.append(f"    {fmt_semitones(sh.pitch):>5} st  "
-                 f"{name:<{w}s} "
-                 f"{fmt_time(rep.offset):>9s}  "
-                 f"{fmt_elapsed(sh.t_walk):>10}  "
-                 f"{rep.score:6.3f}  "
-                 f"{rep.best.frame_support*100:3.0f}%{mark}")
+    row = (f"    {fmt_semitones(sh.pitch):>5} st  "
+           f"{name:<{w}s} "
+           f"{fmt_time(rep.offset):>9s}  "
+           f"{fmt_elapsed(sh.t_walk):>10}  "
+           f"{rep.score:6.3f}  "
+           f"{rep.best.frame_support*100:3.0f}%{mark}")
+    lines.append(row)
+    query.rows.append(row)
     query.entries.append((True, lines))
     if (lazy and len(pitches) > 1 and query.best.confident
             and query.stopped_at is None):
@@ -603,8 +627,11 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
         # the first shift that is confident enough to be answered with, lazy or
         # not. In lazy mode the sweep is over here, so this is the result of the
         # query; in non-lazy mode it is only a provisional one - hence where it
-        # is written (see report_intermediate).
+        # is written (see report_intermediate). The row is remembered as the one
+        # about to be cut out, so that a search printing its shifts as it goes
+        # can say on the line itself that this one was written already.
         query.found_confident = True
+        query.cut_row = len(query.rows) - 1
 
 
 def report_query(query: BatchQuery, index: SearchIndex, args,
@@ -629,18 +656,25 @@ def report_query(query: BatchQuery, index: SearchIndex, args,
     # after a batch there is one block per query, and a table of shifts with no
     # name above it belongs to nobody. The blank line before it keeps the blocks
     # apart, which is all that separates them once a batch is done.
-    print()
-    print(f"QUERY  : {label}", flush=True)
-    for _ok, lines in shown:
-        for line in lines:
-            print(line, flush=True)
+    # A table that was printed row by row as the shifts came in is not printed
+    # again here: that would put every row on the screen twice.
+    if not query.shown_live:
+        print()
+        for _ok, lines in shown:
+            for line in lines:
+                print(line, flush=True)
     reported = sum(1 for ok, _lines in shown if ok)
     if query.stopped_at is not None and query.stopped_at < len(pitches):
         # one line about the shifts that were not tried at all: a line per
-        # skipped shift buries the table under them on a wide sweep
+        # skipped shift buries the table under them on a wide sweep. It says
+        # what is MISSING from the table, so it goes straight under it rather
+        # than under the report that follows - otherwise the blank line and the
+        # name of the query stand between the two and make them look unrelated.
         print(f"    Next pitches were skipped, "
               f"{fmt_semitones(query.best.pitch)} st was already confident "
               f"(use non-lazy mode to try all pitches anyway)")
+    print()
+    print(f"QUERY  : {label}", flush=True)
     best = query.best
     if best is None:
         return None, query.computed, query.t_sum, query.errs
@@ -677,8 +711,7 @@ def report_query(query: BatchQuery, index: SearchIndex, args,
              f"(≈{fmt_elapsed(per_query)} per query)" if nbatch > 1 else "")
     print(f"  TIME     : index search over {reported}/{query.computed} "
           f"pitch(es) took {fmt_elapsed(batch_time)}{where}. Use non-lazy mode "
-          f"to check all pitches anyway (might be even faster for unsuccessful "
-          f"searches)")
+          f"to check all pitches anyway")
     return best, query.computed, query.t_sum, query.errs
 
 def shifts_this_round(pitches: List[float], at: int, one_pass: bool,
@@ -695,19 +728,68 @@ def shifts_this_round(pitches: List[float], at: int, one_pass: bool,
       one walk instead of one per shift, but still one group of fineness at a
       time;
     * a one-pass round hands over everything left whatever group it falls in,
-      because that is what --norounds and --nonlazy ask for.
+      because that is what --pitchbatch=all and --nonlazy ask for.
 
     The group is where a bundled round stops: with the finer order the
     semitones are settled before the halves are looked at, which is the order
     the groups exist for. With a step of 1 every shift is a whole semitone, so
-    there is a single group and a bundled round is the whole of the rest, as it
-    was before.
+    there is a single group and a bundled round is the whole of the rest.
     """
     if one_pass:
         return range(at, len(pitches))
     if bundled:
         return range(at, group_end(pitches, at, order))
     return range(at, at + 1)
+
+
+def resolve_pitchbatch(requested: str, nonlazy: bool) -> str:
+    """
+    Which order the collection is really walked in, out of what was asked for.
+
+    `--nonlazy` says every shift has to be searched, whatever else becomes true
+    of a query once one of them is confident. In the dynamic order that is also
+    what empties the batch: nothing finishes early for the sake of a confident
+    match, so the cap that stops splitting fires on the very first round and
+    every shift that is left goes into one walk. That is the `all` order, arrived
+    at by accident and by a rule nobody sees, so asking for `dynamic` together
+    with `--nonlazy` is read as `all` instead - the same walk, arrived at on
+    purpose.
+
+    `single` is left as it is. One shift per walk is exactly what a person who
+    wants to watch a query go through every shift asked for, and `--nonlazy`
+    takes away the reason to stop early, not the reason to walk once per shift.
+    """
+    return "all" if nonlazy and requested == "dynamic" else requested
+
+
+def show_shift(query: BatchQuery, headed: bool) -> bool:
+    """
+    Prints the line of the shift that has just been searched - one line, the one
+    for this pitch, and not the ones above it that are already on the screen.
+
+    The heading goes out with the first of them, so that a search showing its
+    shifts as it goes reads as the table it is building rather than as a list
+    of numbers with no columns named. It is the same heading the final report
+    prints, and it fits the columns because the width of the source column is
+    measured from the file names of this very query.
+
+    Returns whether the heading has been printed by now, for the caller to pass
+    on: this runs once per pitch and there is nothing in the query to remember
+    that for.
+    """
+    if not headed and query.head:
+        for line in query.head:
+            print(line, flush=True)
+        headed = True
+    if query.rows:
+        row = query.rows[-1]
+        if query.cut_row == len(query.rows) - 1 and "[confident]" in row:
+            # this shift was good enough to answer with, so its fragment has
+            # been cut out already - said here, on the line about that shift,
+            # rather than as a block of file names over the table
+            row = row.replace("[confident]", "[confident, exported]")
+        print(row, flush=True)
+    return headed
 
 
 def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
@@ -720,26 +802,44 @@ def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
     A ROUND is one walk that gives every query still in play its next shift.
     Queries that come back confident leave the batch - and are written down
     there and then, not at the end - so a later round answers fewer of them.
-    If a round leaves nearly everybody in play, it did not earn its walk, and the
-    rest is bundled: one walk per group of pitches rather than one per shift.
 
-    Bundling stops at the end of the group. With the finer order the whole
-    semitones come first, so a round that found nothing at 0, ±1, ±2 says so
-    after the semitones and leaves the halves for the next walk - which is
-    where they belong, since a sample that is not at a whole semitone at all is
-    the rarer case, and one that IS there but hard to match is better found by
-    a walk over the halves than by a single walk over everything at once, which
-    only learns the same thing an hour later. With a step of 1, or with the
-    symm order, there is one group and this is the old bundling unchanged.
+    --pitchbatch says what a round is allowed to be, and the three answers are
+    the three orders the collection is walked in:
 
-    --norounds asks for no rounds at all: one walk answers every remaining
-    shift of every query of the batch. --nonlazy does the same on its own,
-    because a query that is never allowed to stop gives a round nothing to
-    remove, and rounds would only add walks. Both of those are a request for
-    one walk over everything, so neither of them stops at a group.
+    * **single** gives every round one shift and never bundles. It is the
+      default, and with --batch 1 it prints the heading of the table of shifts
+      once and then one line per shift as it is searched, so a long search is
+      something to watch rather than to wait for.
+    * **dynamic** stops splitting once a round has stopped too few queries to be
+      worth its walk, and from there bundles the rest - one walk per group of
+      pitches rather than one per shift. Bundling stops at the end of the group:
+      with the finer order the whole semitones come first, so a round that found
+      nothing at 0, ±1, ±2 says so after the semitones and leaves the halves for
+      the next walk. A sample that is not at a whole semitone at all is the rarer
+      case, and one that IS there but hard to match is better found by a walk
+      over the halves than by a walk over everything at once, which only learns
+      the same thing an hour later.
+    * **all** has no rounds: one walk answers every remaining shift of every
+      query of the batch. --nonlazy used to ask for it by itself, and no longer
+      does - a walk that answers every shift at once shows nothing until it is
+      over, which is no way to watch a search, and a person asking to see every
+      pitch is asking to watch one.
+
+    None of the three changes what is found: the shifts are tried in the same
+    order whichever is asked for, so the verdict and the winner are the same and
+    only the walks differ.
     """
-    one_pass = args.norounds or args.nonlazy
+    # One walk for the whole rest is asked for by name only. --nonlazy says
+    # WHICH shifts are searched and --pitchbatch how they are walked; resolve_pitchbatch
+    # has already folded the one combination that made those two disagree.
+    one_pass = args.pitchbatch == "all"
+    # the whole table after every shift, but only where there is one query to
+    # show it for: with several in the batch the table of one of them would be
+    # the only one on the screen, which says less than saying nothing until the
+    # batch is done. That is what a batch is for.
+    live = args.pitchbatch == "single" and len(queries) == 1
     bundled = False
+    headed = False               # has the heading of the table gone out yet
     alive = list(range(len(queries)))
     while alive:
         todo: List[Tuple[BatchQuery, Shift]] = []
@@ -779,16 +879,27 @@ def solve_batch(queries: List[BatchQuery], index: SearchIndex, args,
                 # may never finish
                 q.told = True
                 report_intermediate(q, index, args, run_dir, unsure_dir,
-                                   s_base, noted)
+                                   s_base, noted, quiet=live)
+        if live:
+            # after every shift, and only the query there is one of: the heading
+            # once, and then the one line of this pitch under it, so the block
+            # on the screen is the table the report would have printed, built a
+            # row at a time as the shifts come in
+            headed = show_shift(queries[0], headed)
+            queries[0].shown_live = True
         if one_pass:
             break
         before = len(alive)
         alive = [i for i in alive if not queries[i].done]
-        # a round that stopped almost nobody will not be followed by one that
-        # stops a lot: the rest is cheaper to compute in fewer walks - one per
-        # group of pitches, so that a query still gets its answer at the end of
-        # the semitones instead of at the end of everything
-        if alive and (before - len(alive)) * ROUND_STOP_SHARE < before:
+        # A round that stopped almost nobody will not be followed by one that
+        # stops a lot, and from there the rest is cheaper to compute in fewer
+        # walks - one per group of pitches, so that a query still gets its answer
+        # at the end of the semitones instead of at the end of everything. Only
+        # the dynamic order does this: single asked for one shift per round and
+        # stays one shift per round however badly the rounds go, and all is a
+        # single walk from the first.
+        if (alive and args.pitchbatch == "dynamic"
+                and (before - len(alive)) * ROUND_STOP_SHARE < before):
             bundled = True
 
 
@@ -801,16 +912,16 @@ def sweep(queries: List[Tuple[str, Optional[np.ndarray]]],
     Searches every query at every shift, prints the table of shifts and the
     report of the shift that won, and exports that one.
 
-    Three orders walk the collection, and --nonlazy turns the lazy stopping off
-    on top of any of them (see solve_batch and search_one):
+    --pitchbatch says how a batch of queries is walked through the shifts
+    (solve_batch); --nonlazy turns the lazy stopping off on top of any of them.
 
-    * the default goes in rounds over a batch of --batch queries;
-    * --norounds answers a whole batch of them in one walk;
-    * --nopitchbatch takes them one at a time, one shift per walk, and reports
-      a query as soon as its own shifts are done.
+    There is one order this function chooses for itself: a collection held in
+    memory has no index to walk once for a batch, so there is nothing to batch
+    it over and every query is searched on its own (search_one).
 
-    The order the shifts are tried in does not depend on any of them, so all
-    three find the same matches and give the same verdict.
+    The order the shifts are tried in does not depend on any of this, so it
+    makes no difference to what is found - only to how many walks it takes and
+    how soon the first line of the answer appears.
     """
     results: List[Tuple[str, Report]] = []
     failed: List[Tuple[str, str]] = []
@@ -819,7 +930,7 @@ def sweep(queries: List[Tuple[str, Optional[np.ndarray]]],
     ready = [(label, x) for label, x in queries if x is not None]
     # a collection held in memory has no index to walk once for a batch, so
     # there is nothing to batch it over
-    batched = not args.nopitchbatch and index.coarse is not None
+    batched = index.coarse is not None
     # said once for the whole run: it introduces the block of file names that
     # the matches exported in advance add up to
     noted: Dict[str, bool] = {}
@@ -867,7 +978,8 @@ def search_one(query: BatchQuery, index: SearchIndex, args,
                pitches: List[float], lazy: bool, run_dir: str,
                unsure_dir: str, s_base: str, noted: Dict[str, bool]) -> None:
     """
-    The --nopitchbatch order: one query, one shift, one walk of the collection.
+    One query, one shift, one walk of the collection: the order for a collection
+    that has no on-disk index to share between the queries.
 
     Nothing is shared with another query, so a result is printed the moment its
     own shifts are done - at the price of walking the collection again for every
@@ -1168,26 +1280,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--nonlazy", action="store_true",
                     help="try every pitch shift even after one of them gave a "
                          "confident match: slower, and it finds a better match "
-                         "at a later shift more often")
-    ap.add_argument("--nopitchbatch", action="store_true",
-                    help="run each pitch individually: take one query at a time "
-                         "and walk the whole library once for each of its "
-                         "shifts. The search is slower, but a query is "
-                         "reported as soon as its own shifts are done, without "
-                         "waiting for the rest of the batch")
-    ap.add_argument("--norounds", action="store_true",
-                    help="do not go through the library in rounds: answer every "
-                         "shift of every query of the batch in a single walk. "
-                         "Slower than the default when many queries are found "
-                         "early, faster when most of them need most shifts; "
-                         "implied by --nonlazy")
+                         "at a later shift more often. It says which shifts are "
+                         "searched, not how they are walked: with "
+                         "--pitchbatch=single (the default) each of them still "
+                         "gets its own pass over the collection and the table "
+                         "still prints after it, so a long search can be watched "
+                         "the whole way")
+    ap.add_argument("--pitchbatch", choices=("single", "dynamic", "all"),
+                    default="single",
+                    help="how a batch of queries is walked through the shifts. "
+                         "'single' (default): one shift per pass over the "
+                         "collection, every time, so a search reports what it "
+                         "found as it finds it - with --batch 1 the table of "
+                         "shifts searched is printed after every one of them. "
+                         "'dynamic': the same at first, but once a pass stops too "
+                         "few queries to be worth its walk the rest is bundled, "
+                         "one walk per group of pitches - quicker to finish, "
+                         "quieter while it runs. 'all': no rounds, every shift of "
+                         "every query of the batch in a single walk. All three "
+                         "find the same matches in the same order")
     ap.add_argument("--batch", type=int, default=DEFAULT_BATCH,
                     metavar="batch_size",
-                    help="check multiple queries at once while going through "
-                         "the whole library once. Bigger batch means quicker "
-                         "search, but report for individual queries will update "
-                         f"less often (default {DEFAULT_BATCH}; ignored with "
-                         "--nopitchbatch)")
+                    help="how many queries are checked at once while going "
+                         "through the whole library once. A bigger batch means a "
+                         "quicker search, but the report of an individual query "
+                         "is updated less often - you see it once the whole "
+                         f"batch is done (default {DEFAULT_BATCH}; 1 shows every "
+                         "query as it goes)")
     ap.add_argument("--progress-interval", type=float,
                     default=INTERVAL, metavar="SECONDS",
                     help="how often the bar of a pass over the collection, and of the "
@@ -1211,6 +1330,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.query = ["query"]
     if not args.search:
         args.search = ["search"]
+    # settled once, here, so that everything below reads the order that will
+    # really be walked rather than the one that was asked for
+    args.pitchbatch = resolve_pitchbatch(args.pitchbatch, args.nonlazy)
 
     try:
         if args.selftest:
@@ -1355,18 +1477,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # not depend on the query, so the orders differ only in how they share
         # that work - the shifts themselves are tried in the same order either
         # way, and the verdict is the same.
-        if args.nopitchbatch:
-            order = ("the whole collection is scanned again for every single "
-                     "shift, one query at a time")
-        elif args.norounds or args.nonlazy:
+        if args.pitchbatch == "all":
             order = (f"the whole collection is scanned once per "
                      f"{args.batch} quer(y/ies), every shift answered from "
                      f"that pass")
-            if args.nonlazy and not args.norounds:
-                order += "  (--nonlazy, so there are no rounds to save work)"
-        else:
+        elif args.pitchbatch == "dynamic":
             order = (f"the whole collection is scanned in rounds, {args.batch} "
                      f"quer(y/ies) and one (or more) pitch at a time")
+        elif args.nonlazy:
+            order = (f"the whole collection is scanned in rounds, one pitch "
+                     f"at a time, every pitch searched")
+        elif args.batch > 1:
+            order = (f"the whole collection is scanned in rounds, {args.batch} "
+                     f"quer(y/ies) and one pitch at a time")
+        else:
+            order = (f"the whole collection is scanned in rounds, one pitch "
+                     f"at a time")
         print(f"Order     : {order}", flush=True)
 
         results, sweep_failed, attempts, t_search_all = sweep(
