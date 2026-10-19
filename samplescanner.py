@@ -578,7 +578,15 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
     if query.stopped_at is None:
         if query.best is None or rep.score > query.best.score:
             query.best = rep
-            mark = "  <- best so far" + (" [confident]" if rep.confident else "")
+            # With one query in the batch its table is printed before the
+            # verdict and points down at it. With several the table goes inside
+            # the verdict, at the end of it, and "best so far" would read as if
+            # some later shift might still beat this one - it cannot, the sweep
+            # of this query is finished by then. What it did beat is said
+            # instead: it was the best of its moment.
+            lead = "  <- best so far" if nbatch <= 1 \
+                else "  <- was best at the moment"
+            mark = lead + (" [confident]" if rep.confident else "")
         else:
             mark = ""
     else:
@@ -593,7 +601,10 @@ def take(query: BatchQuery, sh: Shift, index: SearchIndex, args,
         # answer - the answer is in the report that comes after them
         lines.append("    Best matches for each pitch (intermediate results, "
                      "in order checked, see VERDICT below for final results "
-                     "and closest candidates)")
+                     "and closest candidates)" if nbatch <= 1 else
+                     "    Best matches for each pitch (intermediate results, "
+                     "in order checked, see final results and closest "
+                     "candidates in the verdict above)")
         left = (f"    {'pitch':>6}  {'source':<{query.name_w}s} "
                 f"{'position':>9}  ")
         lines.append(f"{left}{'time spent':>10}  {'r':>6}  {'frames':>6}")
@@ -648,35 +659,51 @@ def report_query(query: BatchQuery, index: SearchIndex, args,
     time of a shift is measured against; `nbatch` is how many queries shared
     them. What this query is charged for the run is its own share, not the
     batch - see the return value.
+
+    WHERE the table of shifts goes depends on what is under it. With one query
+    in the batch there is nothing to confuse it with, so it comes before the
+    name of the query and points down at the verdict. With several, one block
+    per query is written one after another and a table printed above the name
+    reads as though it belonged to the query below it - which is exactly how it
+    was being read. So with a batch the table goes into the verdict, after the
+    candidates and the fragment and before the TIME line, and its heading says
+    where the answer is rather than that it is below.
     """
     label = query.label
     shown = query.entries if query.stopped_at is None \
         else query.entries[:query.stopped_at]
-    # the query is named BEFORE its shifts, not between them and the report:
-    # after a batch there is one block per query, and a table of shifts with no
-    # name above it belongs to nobody. The blank line before it keeps the blocks
-    # apart, which is all that separates them once a batch is done.
-    # A table that was printed row by row as the shifts came in is not printed
-    # again here: that would put every row on the screen twice.
-    if not query.shown_live:
-        print()
-        for _ok, lines in shown:
-            for line in lines:
-                print(line, flush=True)
+    # the table and the line about the shifts that were not tried are one piece
+    # of text and travel together, whichever of the two places it is printed in
+    table: List[str] = [line for _ok, lines in shown for line in lines]
     reported = sum(1 for ok, _lines in shown if ok)
     if query.stopped_at is not None and query.stopped_at < len(pitches):
         # one line about the shifts that were not tried at all: a line per
         # skipped shift buries the table under them on a wide sweep. It says
-        # what is MISSING from the table, so it goes straight under it rather
-        # than under the report that follows - otherwise the blank line and the
-        # name of the query stand between the two and make them look unrelated.
-        print(f"    Next pitches were skipped, "
-              f"{fmt_semitones(query.best.pitch)} st was already confident "
-              f"(use non-lazy mode to try all pitches anyway)")
+        # what is MISSING from the table, so it goes straight under it, in
+        # whichever of the two places the table itself went.
+        table.append(f"    Next pitches were skipped, "
+                     f"{fmt_semitones(query.best.pitch)} st was already "
+                     f"confident (use non-lazy mode to try all pitches anyway)")
+    # a table printed row by row as the shifts came in is not printed again:
+    # that would put every row on the screen twice
+    in_verdict = nbatch > 1 and not query.shown_live
+    if not query.shown_live and not in_verdict:
+        # the query is named AFTER its shifts, not between them and the report:
+        # the blank line keeps the blocks apart, which is all that separates
+        # them once a batch is done
+        print()
+        for line in table:
+            print(line, flush=True)
     print()
     print(f"QUERY  : {label}", flush=True)
     best = query.best
     if best is None:
+        # nothing came through at all, so there is no verdict to put a table
+        # into: it goes back above the name, as it is when there is one query
+        if in_verdict:
+            print()
+            for line in table:
+                print(line, flush=True)
         return None, query.computed, query.t_sum, query.errs
     # hand the candidates of every shift to the report
     best.sweep_candidates = (
@@ -702,6 +729,12 @@ def report_query(query: BatchQuery, index: SearchIndex, args,
         flash(f"cutting the fragments of {os.path.basename(label)}")
         export_report(best, run_dir, unsure_dir, not args.no_export,
                       s_base, args.unsure_min_sim)
+    if in_verdict:
+        # the table closes the verdict it belongs to: under the candidates and
+        # the fragment, over the line that says what the whole thing cost
+        print()
+        for line in table:
+            print(line, flush=True)
     # What a pass cost is what the whole batch cost: the shifts of every query
     # in it were computed in the same pass. The share of it that is one query's
     # is given in brackets, and the run is totalled from the shares, so that the
