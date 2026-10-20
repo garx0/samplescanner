@@ -1864,8 +1864,12 @@ class App(tk.Tk):
         Removes what the last update left behind, a moment after the program
         starts - the updater is still leaving when the program it put in place
         begins, and a copy that is still held cannot be deleted.
+
+        What belongs to an update that is going on right now is not touched:
+        the copy is named after the process that made it, and that process is
+        still alive while the update runs.
         """
-        for attempt in range(6):
+        for attempt in range(3):
             time.sleep(2 if attempt else 1)
             try:
                 update_clean_update_folders()

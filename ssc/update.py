@@ -46,16 +46,6 @@ REPO = os.environ.get("SAMPLESCANNER_UPDATE_REPO", "garx0/samplescanner")
 # leaves them exactly as they are.
 KEEP_DIRS = ("cache", "results")
 
-# The suffix the file that is being replaced is given. A running file cannot be
-# written over on Windows, but it CAN be renamed - and a name that is free is a
-# name the new file can be written to. The renamed files are removed at the next
-# start of the program, when nothing holds them any more.
-#
-# It is not ".old" and not ".old.exe": a name that ends in .exe is a program
-# Windows will happily start, and this one is a leftover of a version that is
-# not the one the user thinks they are running.
-OLD_SUFFIX = ".ssc-old"
-
 # The environment variable that tells the program that has just been put in
 # place where the temporary copy of itself is, so that it can remove it.
 UPDATE_TEMP_ENV = "SAMPLESCANNER_UPDATE_TEMP"
@@ -135,6 +125,14 @@ def latest_tag(repo: str = REPO, timeout: float = CHECK_TIMEOUT) -> Optional[str
     with the newest one first and needs no key for a public repository. Nothing
     here raises: a network that is not there is an ordinary answer, and the
     caller treats it as "nothing to offer".
+
+    The API has two ways to ask, and they do not answer the same question. The
+    `latest` one gives the newest release that is NOT marked as a prerelease -
+    which is the right answer for most repositories and the wrong one for a
+    repository whose releases are all prereleases: there is no such release, the
+    API answers 404, and the program would sit quietly for ever while a newer
+    version waits on the page. So when the plain answer is not there, the whole
+    list is asked for and the newest of them is taken.
     """
     request = urllib.request.Request(api_url(repo), headers={
         "User-Agent": f"SampleScanner/{VERSION}",
@@ -144,9 +142,48 @@ def latest_tag(repo: str = REPO, timeout: float = CHECK_TIMEOUT) -> Optional[str
         with urllib.request.urlopen(request, timeout=timeout) as answer:
             body = answer.read().decode("utf-8", "replace")
         tag = str(json.loads(body).get("tag_name") or "").strip()
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return None
+        tag = ""
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
         return None
-    return tag or None
+    if tag:
+        return tag
+    return _newest_prerelease(repo, timeout)
+
+
+def _newest_prerelease(repo: str, timeout: float) -> Optional[str]:
+    """
+    The newest release there is, prereleases included.
+
+    The list comes back newest first, so the first one that has a tag is the
+    newest; the tags are still compared by number, because a repository whose
+    releases are made by hand does not always put them in order.
+    """
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/releases", headers={
+            "User-Agent": f"SampleScanner/{VERSION}",
+            "Accept": "application/vnd.github+json",
+        })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as answer:
+            body = answer.read().decode("utf-8", "replace")
+        releases = json.loads(body)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    best: Optional[str] = None
+    best_version: Optional[tuple] = None
+    for release in releases:
+        tag = str(release.get("tag_name") or "").strip()
+        if not tag:
+            continue
+        version = parse_version(tag)
+        if version is None:
+            continue
+        if best_version is None or version > best_version:
+            best, best_version = tag, version
+    return best
 
 
 def download(url: str, dest: str, timeout: float = DOWNLOAD_TIMEOUT,
@@ -241,34 +278,6 @@ def _wait_until_replaceable(path: str, timeout: float = 120.0) -> bool:
             time.sleep(0.3)
 
 
-def remove_leftover_old(target: str, running_from: Optional[str] = None) -> bool:
-    """
-    Removes the exe of the version before, left over by an update.
-
-    The program that renamed itself out of the way could not delete the file it
-    was running from - Windows will not let a running file be removed - so the
-    file is still there when the program starts next time, and by then nothing
-    holds it. A file that is still held belongs to an update that is going on
-    right now, and is left alone.
-    """
-    if not os.path.isdir(target):
-        return False
-    removed = False
-    for name in os.listdir(target):
-        if not name.endswith(OLD_SUFFIX):
-            continue
-        path = os.path.join(target, name)
-        if running_from and os.path.normcase(os.path.abspath(path)) == \
-                os.path.normcase(os.path.abspath(running_from)):
-            continue                     # the file this program is running from
-        try:
-            os.remove(path)
-            removed = True
-        except OSError:
-            return removed              # held: an update is going on
-    return removed
-
-
 def copy_for_update(target: str) -> str:
     """
     A copy of the program, to run the update from.
@@ -314,8 +323,13 @@ def clean_update_folders(base: Optional[str] = None) -> int:
     The copy is made by the program that is about to be replaced and is removed
     by the program that replaced it, which is the only one that can: the copy
     holds the exe the updater is running from, and a file that is being run
-    cannot be deleted. A copy that is still held belongs to an update that is
-    going on right now, and is left for the next try.
+    cannot be deleted.
+
+    A copy whose update is going on RIGHT NOW is left alone: the folder is
+    named after the process that made it, and that process is still alive while
+    the update runs. Removing it then would delete the copy out from under the
+    update that is filling it - which is exactly what happened before this was
+    looked at.
     """
     base = base or tempfile.gettempdir()
     removed = 0
@@ -329,12 +343,34 @@ def clean_update_folders(base: Optional[str] = None) -> int:
         path = os.path.join(base, name)
         if not os.path.isdir(path):
             continue
+        pid = name[len("sssc-update-"):]
+        if pid.isdigit() and _process_alive(int(pid)):
+            continue                    # an update is going on right now
         try:
             shutil.rmtree(path)
             removed += 1
         except OSError:
             continue                    # held: an update is going on
     return removed
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether a process with that number is still running."""
+    if pid <= 0 or os.name != "nt":
+        return False
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259         # STILL_ACTIVE
+    except Exception:
+        return False
 
 
 def _same_file(one: str, two: str) -> bool:
@@ -409,7 +445,11 @@ def apply_update(zip_path: str, target: str, exe_path: str,
     for name in KEEP_DIRS:
         os.makedirs(os.path.join(target, name), exist_ok=True)
     if restart:
-        _start(exe_path, target, temp)
+        # the temporary copy of the program is told where it is through the
+        # environment, so that the program that is started now can remove it
+        # once it is running - the copy holds the exe this one is running from,
+        # and nothing else can delete that
+        _start(exe_path, target, os.environ.get(UPDATE_TEMP_ENV) or None)
     return version
 
 
@@ -485,7 +525,7 @@ def apply_update_main(argv: Sequence[str]) -> int:
     if len(argv) > 3 and argv[3].isdigit():
         # the process that started this one: it may still be leaving, and the
         # program it runs is about to be replaced
-        _wait_for_process(int(argv[4]))
+        _wait_for_process(int(argv[3]))
     try:
         version = apply_update(zip_path, target, exe_path)
     except Exception as exc:                         # noqa: BLE001 - reported
@@ -495,8 +535,19 @@ def apply_update_main(argv: Sequence[str]) -> int:
     return 0
 
 
-def _wait_for_process(pid: int, timeout: float = 60.0) -> None:
-    """Waits until the process with that number is gone."""
+def _wait_for_process(pid: int, timeout: float = 120.0) -> None:
+    """
+    Waits until the process with that number is gone.
+
+    The program that starts the update is still running while the update waits
+    for it: it has the files of the program folder open, and they cannot be
+    written over while it holds them. So the wait is not a courtesy, it is the
+    whole point - without it the update writes over an exe that is running.
+
+    A process that has ended has an exit code of its own, and one that is still
+    running has 259, which is what STILL_ACTIVE means. The two are easy to mix
+    up, and mixing them up means writing over a running program.
+    """
     if pid <= 0 or os.name != "nt":
         return
     try:
@@ -512,8 +563,8 @@ def _wait_for_process(pid: int, timeout: float = 60.0) -> None:
             ctypes.windll.kernel32.GetExitCodeProcess(handle,
                                                        ctypes.byref(code))
             ctypes.windll.kernel32.CloseHandle(handle)
-            if code.value != 0:            # STILL_ACTIVE is 259
-                return
+            if code.value != 259:         # STILL_ACTIVE is 259
+                return                     # it has ended
             time.sleep(0.2)
     except Exception:
         return
