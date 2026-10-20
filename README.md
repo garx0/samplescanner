@@ -116,3 +116,55 @@ That folder must be **writable**. Don't unpack the archive into
 `C:\Program Files`, `/Applications`, a folder of another user, or onto a
 read-only disk (you will receive an error before the search starts if the folder
 isn't writable).
+
+## How the search works
+
+Two passes: a cheap one over an index of the whole collection, and an exact one
+over a handful of places it points at (the actual audio).
+
+**Preparation.** Every file — the collection and the query alike — is decoded to 
+**22050 Hz mono**. The query is trimmed of silence and resampled by
+the pitch shift.
+
+**The index** (built once per collection, kept on disk next to the program). For
+each file: a **log-mel spectrogram in 48 bands**, one frame every 23 ms, plus the
+**energy of each frame**. Two small `.npy` files per track — the whole index of
+a large collection is a couple of gigabytes (33.6 kbps) instead of the dozens 
+of gigabytes the audio itself takes.
+
+**The coarse pass.** The query's log-mel profile, normalised, is correlated
+against the profiles of the indexed files; a check on the frame energy throws
+away the windows that plainly do not sound like the query. The peaks of that
+correlation are the candidates: at most a few places per file, and **24
+candidates in total** go on to the next pass. This pass never touches the audio.
+
+**The precise pass.** For those 24 places the original files are re-read around
+the candidate position, the full feature bank is computed (log-mel at several
+resolutions, one frame every 5.8 ms), and the query is compared with what was
+read by **cosine similarity**. That is the `r` in the report.
+
+**What the answer is made of.** Three numbers:
+
+- **`r`** — the cosine similarity, 0 to 1. Real matches sit around 0.45-0.9;
+- **`frames`** — the share of the query that is really there. The query is cut
+  into frames of 5.8 ms, and a frame counts if the sound in the source at that
+  moment looks like that frame (correlation above 0.5). It answers "how much of
+  the query is accounted for": `r` can be high while only half of the query
+  matches;
+- **`margin`** — how much better the winner is than the runner-up: the best
+  other moment *in the same file*, and the best moment *in the other files*.
+  Repeats of the same fragment and equivalent copies of one recording are not
+  counted as competitors, or the margin would always come out zero.
+
+The verdict is decided by those three: **confident** when `r` ≥ 0.55 with
+margin ≥ 0.12 and frames ≥ 0.15, or when the margin is decisive (≥ 0.25) and
+`r` ≥ 0.45 even if few frames are explained; **probable** from `r` ≥ 0.42;
+**weak match** from `r` ≥ 0.32; below that the source is most likely not in the
+collection. The fragment is cut out at a lower bar than that — `r` ≥ 0.38 and
+margin ≥ 0.08 — because having the audio to listen to is useful even when the
+program is not sure.
+
+**Pitch.** The query is tried at every shift in the range, and each shift is a
+query of its own: whole semitones first, then the fractions (if step smaller 
+than 1 is selected), so that a sample which is not at a whole semitone is still 
+found, but only after the likely places have been checked.
