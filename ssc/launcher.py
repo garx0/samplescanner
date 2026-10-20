@@ -51,6 +51,21 @@ def launcher_dir() -> Optional[str]:
     return None
 
 
+def launcher_exe() -> Optional[str]:
+    """
+    The launcher itself as a file - the thing an update has to replace.
+
+    None when the program is run from sources: there is no exe there, and a
+    copy of the program that replaces nothing is not an update.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    if _compiled is not None:
+        arg0 = getattr(_compiled, "original_argv0", None) or sys.argv[0]
+        return os.path.abspath(arg0)
+    return None
+
+
 def launcher_argv() -> list:
     """
     The command that runs this same program again — how the window starts a
@@ -75,6 +90,11 @@ def launcher_argv() -> list:
 # window or the search. One exe is three programs, told apart by what they are
 # asked to do — the same arrangement the search itself already uses.
 CONVERT_FLAG = "--convert-caches"
+
+# The argument that makes the frozen launcher be the second copy of the program
+# that puts a downloaded version in place. It is the same arrangement again: one
+# exe, several things it can be, told apart by the first argument.
+UPDATE_FLAG = "--apply-update"
 
 
 def converter_argv() -> list:

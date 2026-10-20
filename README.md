@@ -1,9 +1,22 @@
 # SampleScanner
 
-Finds which track of your music collection a short audio fragment was taken
-from, and at what second and pitch.
+(Micro)sample searcher for local libraries. Finds which track of your music
+collection a short audio fragment was taken from, with timestamp and pitch.
 
-## Installation (from source code)
+## 1a. Installation (easy way, Windows only)
+
+Download the latest Windows build from the [releases page](https://github.com/garx0/samplescanner/releases).
+
+Download **ffmpeg** from <https://ffmpeg.org/download.html> (the `gyan.dev` builds
+recommended for Windows), unpack the archive and put **`ffmpeg.exe` and
+`ffprobe.exe` next to `SampleScanner.exe`** (or add its `bin` folder to
+`PATH` environment variable). SampleScanner uses ffmpeg to read and write audio.
+
+No other installation needed, the program is portable. Just place the
+`SampleScanner` folder anywhere you like and the program will "live" inside it
+and write files only inside it.
+
+## 1b. Installation from source code (macOS, Linux, Windows) (this installation method was not tested!)
 
 The program reads and writes audio using **ffmpeg and ffprobe**, which are not
 bundled with SampleScanner. Install both for your system:
@@ -22,8 +35,8 @@ bundled with SampleScanner. Install both for your system:
   (Fedora), `sudo pacman -S ffmpeg` (Arch). A static build next to
   `samplescanner.py` works too.
 
-A build unpacked next to the program is looked for as `ffmpeg.exe`/`ffprobe.exe` on 
-Windows and as `ffmpeg`/`ffprobe` on macOS and Linux. Anything on `PATH` is found 
+A build unpacked next to the program is looked for as `ffmpeg.exe`/`ffprobe.exe` on
+Windows and as `ffmpeg`/`ffprobe` on macOS and Linux. Anything on `PATH` is found
 whatever it is called.
 
 Install **Python 3.9 or newer**, then run `pip install -r requirements.txt`
@@ -48,62 +61,58 @@ comes with the python.org installer and with brew's python.
 
 Note that on macOS and Linux the command is `python3`, not `python`.
 
-After installation and usage, if the author updated the SampleScanner upload 
-with a new version, you'll need to move your contents of results and cache 
-folders manually in a directory with the new version. You'll be able to reuse 
-the cache (aka index, fingerprints) you've generated (unless the author has 
-rewritten the way it creates and reads the cache in one of the updates).
+## 2. Running it
 
-## Running it
-
-To run SampleScanner with interface, run `python samplescanner_gui.py`
-(`python3 …` on macOS and Linux). Pick 
-what to look for, pick where to look, configure pitches to check, press 
+To run SampleScanner with interface, run `SampleScanner.exe`. Pick
+what to look for, pick where to look, configure pitches to check, press
 "Start the search".
+(if using source code version, replace `SampleScanner.exe` with
+`python samplescanner_gui.py` on Windows / `python3 samplescanner_gui.py`
+on macOS/Linux).
 
-To run SampleScanner in command line, run the following command, specifying 
-path to query file/queries folder, sources folder, and pitch range and step:
+To run SampleScanner in command line, run the following command, specifying
+path to query file/queries folder (or txt file), sources folder (or txt file),
+and pitch range and step:
 
 ```
-python samplescanner.py -q "<queries>" -s "<sources>" --pitch=<MIN>:<MAX>:<STEP> -v
+SampleScanner.exe -q "<queries>" -s "<sources>" --pitch=<MIN>:<MAX>:<STEP> -v
 ```
 
-(you can specify `samplescanner_gui.py` instead of `samplescanner.py` here)
-
-`--version` prints the version of the program and stops, if you want to check
-which one you have.
+(if using source code version, replace `SampleScanner.exe` with
+`python samplescanner_gui.py` on Windows / `python3 samplescanner_gui.py`
+on macOS/Linux).
 
 Use case: start new search (with one or multiple samples to find in the selected
 library) and play the wav files (with the finds worth checking) appearing in the
 results/... folder while the search progresses.
 
-SampleScanner will take extra time indexing (caching) the files it sees for the 
-first time, so the next searches in the same folders will be faster (unless you 
-clear the `cache` folder). The index takes 4.2 KBytes per second of audio 
-(33.6 kbps).
+SampleScanner will take extra time indexing (caching) the files it sees for the
+first time, so the next searches in the same folders will be faster (unless you
+clear the `cache` folder). The index takes 4.2 KBytes per second of audio
+(33.6 kbps), containing aggregated features of audio spectrogram. The index
+(cache) is used on scanning stage, then the actual audio files are used on
+"verifying" stage.
 
 **What may be picked**, for both the query and the library:
 
 * one or several audio files (Ctrl and Shift pick several at once);
-* a folder — subfolders are read too, and anything that is not audio is skipped;
-* a **text file** with a list, one entry per line: folders, audio files and
-  `glob` patterns (`F:\music\Artist *\*.flac` on Windows, `~/music/Artist */`
-  on macOS and Linux) may be mixed in one list. Blank lines and everything after
-  a `#` are ignored. A relative entry counts from the folder of that text file,
-  so a list can be moved together with the collection it describes. To pick a
-  text file in the window, switch the file type in the dialog from `Audio` to
-  `Text`.
+* one or several folders (Ctrl and Shift pick several at once);
+* a **text file** with a list of files/folders/glob patterns, one entry per line.
+  Blank lines and everything after a `#` are ignored. A relative entry counts
+  from the folder of that text file, so a list can be moved together with the
+  collection it describes. To pick a text file in the window, switch the file type
+  in the dialog from `Audio` to `Text`.
 
 ## Where it writes
 
-Only into the folder the program is started from: `cache` (the index it builds
-once per collection) and `results` (one folder per run, holding a `log_….txt`
-with everything the run printed, and the fragments it cut out). With the ready
-exe that folder is the one the exe is in; from source code it is the folder you
-run the command in, so start it from the unpacked archive — that is where those
-two folders belong.
+SampleScanner only writes into the folder the program is started from: into
+`cache` (the cache it builds once per collection) and `results` (one folder per
+run, holding a `log_….txt` with everything the run printed, and the audio
+fragments it cut out). With the ready exe that folder is the one the exe is in;
+from source code it is the folder you run the command in, so start it from the
+unpacked archive — that is where those two folders belong.
 
-That folder must be **writable**. Unpack the archive somewhere you own — your
-home directory is the safe answer — and not into `C:\Program Files`, into
-`/Applications`, into a folder of another user, or onto a read-only disk. The
-program will let you know before a search starts if it is wrong.
+That folder must be **writable**. Don't unpack the archive into
+`C:\Program Files`, `/Applications`, a folder of another user, or onto a
+read-only disk (you will receive an error before the search starts if the folder
+isn't writable).

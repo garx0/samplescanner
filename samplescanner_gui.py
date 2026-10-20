@@ -27,6 +27,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -76,10 +77,16 @@ def hide_own_console() -> None:
 # same launcher can be, reached by the one argument that says so, so that a build
 # of this program ships the converter without a second exe next to the first.
 if len(sys.argv) > 1:
-    from ssc.launcher import CONVERT_FLAG                  # noqa: E402
+    from ssc.launcher import CONVERT_FLAG, UPDATE_FLAG       # noqa: E402
     if sys.argv[1] == CONVERT_FLAG:
         from convert_caches_1to2 import main                # noqa: E402
         sys.exit(main(sys.argv[2:]))
+    if sys.argv[1] == UPDATE_FLAG:
+        # the second copy of the program, the one that puts a downloaded
+        # version in place while this one is being closed
+        hide_own_console()
+        from ssc.update import apply_update_main             # noqa: E402
+        sys.exit(apply_update_main(sys.argv[2:]))
     from samplescanner import main                         # noqa: E402
     sys.exit(main(sys.argv[1:]))
 hide_own_console()
@@ -129,9 +136,12 @@ HINT_WRAP = 600
 # this costs nothing and the lines under the sliders cannot drift away from what
 # the search will really try.
 from ssc.config import DEFAULT_BATCH                                      # noqa: E402
-from ssc.format import exe_name, fmt_elapsed
+from ssc.format import exe_name, fmt_elapsed, fmt_size
 from ssc.launcher import (converter_argv, launcher_argv,         # noqa: E402
-                         launcher_dir)
+                          launcher_dir, launcher_exe)
+from ssc.update import (clean_update_folders as update_clean_update_folders,  # noqa: E402
+                         download, download_url, is_newer, latest_tag,
+                         spawn_updater)
 from ssc.pitch import (count_pitches, describe_pitch_order,          # noqa: E402
                        describe_pitch_set)
 from ssc.status import is_status, plain
@@ -471,6 +481,33 @@ def elide_path(path: str, limit: int = 56) -> str:
         return path
     keep = limit - 3
     return path[:keep // 2] + "..." + path[-(keep - keep // 2):]
+
+
+# The columns of the cache listing, and how wide each of them is.
+#
+# The widths are fixed, and a name that does not fit in its column is shortened
+# to fit: a name of any length has to leave the numbers where they can be
+# compared with each other, and a name that pushes the size column to the right
+# makes two rows impossible to read together. The name gets the most room,
+# because it is the only column nobody can read off the numbers.
+CACHE_NAME_W = 44
+CACHE_SIZE_W = 10
+CACHE_FILES_W = 7
+CACHE_WHEN_W = 16
+
+
+def cache_header() -> str:
+    """The line above the listing that says what each column is."""
+    return (f"{'folder':<{CACHE_NAME_W}} {'size':>{CACHE_SIZE_W}} "
+            f"{'files':>{CACHE_FILES_W}} {'last used':>{CACHE_WHEN_W}}")
+
+
+def cache_row(name: str, size: int, count: int, when: str) -> str:
+    """One line of the listing, in the same columns as the header."""
+    return (f"{elide_path(name, CACHE_NAME_W):<{CACHE_NAME_W}} "
+            f"{fmt_size(size):>{CACHE_SIZE_W}} "
+            f"{count:>{CACHE_FILES_W}} "
+            f"{when:>{CACHE_WHEN_W}}")
 
 
 
@@ -1377,32 +1414,50 @@ class CacheWindow(tk.Toplevel):
 
     The lines come back through a queue rather than being written by the thread,
     because tkinter may only be touched from the thread it was started in.
+
+    The cache is two levels deep - a collection folder with a folder per library
+    inside it - so the window goes into a collection and offers the folders
+    inside it exactly as it offers the collections themselves.
     """
 
     def __init__(self, master, work_dir):
         super().__init__(master)
         self.work_dir = work_dir
         self.title("Cache")
-        self.geometry("760x430")
+        self.geometry("880x430")
         self.transient(master)
         self.rows: list = []           # what the list shows, so deleting need
         self.busy = False              # not walk the whole cache a second time
         self.queue: queue.Queue = queue.Queue()
         self.alive = True
         self.note = ""                 # what to add under the next listing
+        self.cwd = ""                  # where inside the cache we are looking
 
         wrap = ttk.Frame(self, padding=8)
         wrap.pack(fill=tk.BOTH, expand=True)
-        self.listbox = tk.Listbox(wrap, font=(MONO, 9), activestyle="none")
+
+        # The heading is a listbox of its own, one line high, of the same font
+        # and in the same column as the list under it: two widgets of the same
+        # kind with the same font put their text at the same place, so the names
+        # stand above the numbers that belong to them without a line of
+        # measuring. It takes a click and gives it back, so it cannot be picked
+        # for deleting.
+        self.head = tk.Listbox(wrap, font=(MONO, 9), height=1)
+        self.head.insert(tk.END, cache_header())
+        self.head.bind("<Button-1>", lambda e: "break")
+        self.head.grid(row=0, column=0, sticky="ew")
+
+        self.listbox = tk.Listbox(wrap, font=(MONO, 9), activestyle="none",
+                                  selectmode="extended")
         sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
-        wrap.rowconfigure(0, weight=1)
+        self.listbox.grid(row=1, column=0, sticky="nsew")
+        sb.grid(row=1, column=1, sticky="ns")
+        wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(0, weight=1)
 
         self.summary = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.summary, wraplength=720,
+        ttk.Label(self, textvariable=self.summary, wraplength=860,
                   justify=tk.LEFT, padding=(8, 4)).pack(fill=tk.X)
 
         bar = ttk.Frame(self, padding=(8, 4, 8, 8))
@@ -1414,24 +1469,64 @@ class CacheWindow(tk.Toplevel):
         self.sel_btn.pack(side=tk.LEFT, padx=4)
         self.all_btn = ttk.Button(bar, text="Delete all", command=self.delete_all)
         self.all_btn.pack(side=tk.LEFT)
-        ttk.Button(bar, text="Open the cache folder",
-                   command=lambda: open_in_explorer(self.cache_dir())).pack(
+        self.up_btn = ttk.Button(bar, text="Go up", command=self.go_up)
+        self.up_btn.pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(bar, text="Open this folder",
+                   command=lambda: open_in_explorer(self.listing_dir())).pack(
             side=tk.RIGHT)
         self.bind("<Delete>", lambda e: self.delete_selected())
+        self.listbox.bind("<Double-Button-1>", lambda e: self.enter_selected())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.after(80, self._poll)
         self.refresh()
 
+    # ---------- where we are ----------
+
     def cache_dir(self):
         return os.path.join(self.work_dir.get(), "cache")
 
-    def folders(self):
-        """One line per collection: size, file count, when it was last used.
+    def listing_dir(self) -> str:
+        """The folder the list is about: the cache itself, or one inside it."""
+        return self.cwd or self.cache_dir()
+
+    def go_up(self) -> None:
+        """One level up, as long as there is a level to go up to."""
+        if not self.cwd:
+            return
+        parent = os.path.dirname(self.cwd)
+        root = os.path.abspath(self.cache_dir())
+        self.cwd = "" if os.path.normcase(parent) == os.path.normcase(root) \
+            else parent
+        self.refresh()
+
+    def enter_selected(self) -> None:
+        """
+        Into the folder that is selected - the cache is two levels deep, and a
+        collection holds a folder per library inside it, which is what a person
+        with a big cache wants to get at: the whole of a collection is rarely
+        the thing to delete, one library inside it is.
+        """
+        rows = self._selected()
+        if len(rows) != 1:
+            return
+        self.cwd = rows[0][4]
+        self.refresh()
+
+    def _selected(self) -> list:
+        """The rows that are ticked, in the order they are shown."""
+        return [self.rows[i] for i in self.listbox.curselection()
+                if 0 <= i < len(self.rows)]
+
+    # ---------- the listing ----------
+
+    def folders(self, base: str):
+        """One line per folder: size, file count, when it was last used.
 
         Touches nothing but the disk, and only reads it - which is what lets it
-        run in a worker thread.
+        run in a worker thread. The folder it is about is passed in rather than
+        asked for here: reading it means reading a tkinter variable, and that
+        may only happen in the thread the window was made in.
         """
-        base = self.cache_dir()
         if not os.path.isdir(base):
             return []
         out = []
@@ -1461,9 +1556,21 @@ class CacheWindow(tk.Toplevel):
         """Greyed out while something is being counted or removed: a second
         request would ask the worker to do the same walk twice."""
         self.busy = busy
-        state = "disabled" if busy else "normal"
+        self._update_buttons()
+
+    def _update_buttons(self):
+        """
+        Which buttons can be pressed now.
+
+        The button that goes up is apart from the others: it is out of place at
+        the top of the cache, where there is nothing above to go to, and it stays
+        out of place whether the window is busy or not.
+        """
+        state = "disabled" if self.busy else "normal"
         for btn in (self.refresh_btn, self.sel_btn, self.all_btn):
             btn.configure(state=state)
+        self.up_btn.configure(state="normal" if (self.cwd and not self.busy)
+                              else "disabled")
 
     def _start(self, what: str, work, *args):
         self._set_busy(True)
@@ -1488,6 +1595,10 @@ class CacheWindow(tk.Toplevel):
             self._show(what, payload)
             self._set_busy(False)
             if what == "_remove":
+                # the folder the window was inside may be the one that was just
+                # deleted: there is nowhere left to be
+                if self.cwd and not os.path.isdir(self.cwd):
+                    self.cwd = ""
                 # the list still holds the folders that were just deleted, so
                 # the counting starts again by itself rather than leaving the
                 # window showing something that is no longer there
@@ -1508,35 +1619,39 @@ class CacheWindow(tk.Toplevel):
             self.rows = payload
             self.listbox.delete(0, tk.END)
             for name, size, count, when, _p in payload:
-                self.listbox.insert(tk.END, f"{name:<28} {fmt_size(size):>10}"
-                                            f"   {count:>5} files   {when}")
+                self.listbox.insert(tk.END, cache_row(name, size, count, when))
+            where = self.listing_dir()
             if not payload:
-                text = (f"{self.cache_dir()} does not exist yet - the "
-                        f"cache appears after the first search.")
+                text = (f"{where} does not exist yet - the cache appears after "
+                        f"the first search." if not self.cwd else
+                        f"There are no folders inside {where}.")
             else:
                 total = sum(r[1] for r in payload)
-                text = (f"{len(payload)} collection(s), {fmt_size(total)} total. "
-                        f"Tick the ones to remove with Ctrl or Shift. "
-                        f"Deleting costs time, not data: the index of a "
-                        f"collection is built again at its next search.")
+                text = (f"{len(payload)} folder(s), {fmt_size(total)} total, in "
+                        f"{where}. Click one to go into it, Ctrl or Shift to "
+                        f"tick several for deleting. Deleting costs time, not "
+                        f"data: the index of a folder is built again at its "
+                        f"next search. You can do the same by deleting folders "
+                        f"by hand in a file explorer.")
             self.summary.set(f"{text}  {self.note}".strip() if self.note else text)
             self.note = ""
+            self._update_buttons()
         elif what == "_remove":
             # kept for under the listing that follows it, rather than shown for a
             # moment and then counted over
-            self.note = (f"Deleted {len(payload)} folder(s). If Explorer will "
-                         f"not let you delete one by hand, see the note in "
-                         f"README_all.md about running the program as "
-                         f"administrator.")
+            self.note = (f"Deleted {len(payload)} folder(s).")
 
     def refresh(self):
         if self.busy:
             return
+        # the folder is named here, in the thread of the window, and handed to
+        # the worker: naming it there would mean reading a tkinter variable
+        # from a thread that may not touch one
         self._start("Counting the cache - a large one takes a while...",
-                    self._count)
+                    self._count, self.listing_dir())
 
-    def _count(self):
-        return self.folders()
+    def _count(self, base):
+        return self.folders(base)
 
     def _remove(self, rows):
         gone = []
@@ -1550,7 +1665,7 @@ class CacheWindow(tk.Toplevel):
     def _delete(self, rows):
         if not rows:
             messagebox.showinfo("Nothing selected",
-                                "Tick the collections to delete with Ctrl "
+                                "Tick the folders to delete with Ctrl "
                                 "or Shift.", parent=self)
             return
         what = "\n".join(f"  {n}  ({fmt_size(s)})" for n, s, _c, _w, _p in rows)
@@ -1564,8 +1679,7 @@ class CacheWindow(tk.Toplevel):
         self._start("Deleting...", self._remove, rows)
 
     def delete_selected(self):
-        self._delete([self.rows[i] for i in self.listbox.curselection()
-                      if 0 <= i < len(self.rows)])
+        self._delete(self._selected())
 
     def delete_all(self):
         self._delete(list(self.rows))
@@ -1626,6 +1740,42 @@ class HelpWindow(tk.Toplevel):
             side=tk.LEFT, padx=10)
 
 
+class UpdateWindow(tk.Toplevel):
+    """
+    Says that the new version is being fetched, and how far it has got.
+
+    Sixty megabytes over a slow line takes a while, and a window that says
+    nothing while it does is a window the person has already stopped looking
+    at.
+    """
+
+    def __init__(self, master, tag):
+        super().__init__(master)
+        self.title("Updating")
+        self.geometry("460x130")
+        self.resizable(False, False)
+        self.transient(master)
+        ttk.Label(self, text=f"Downloading SampleScanner {tag}...",
+                  padding=(16, 12)).pack(anchor=tk.W)
+        self.bar = ttk.Progressbar(self, mode="determinate", length=428)
+        self.bar.pack(padx=16, fill=tk.X)
+        self.text = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.text, padding=(16, 8),
+                  foreground="#555").pack(anchor=tk.W)
+
+    def progress(self, done: int, total: int):
+        """How far the download has got, in bytes and in words."""
+        if total:
+            self.bar.configure(maximum=total, mode="determinate",
+                               value=done)
+            self.text.set(f"{fmt_size(done)} of {fmt_size(total)}")
+        else:
+            # the server did not say how big the file is: the bar can only spin
+            self.bar.configure(mode="indeterminate")
+            self.bar.start(10)
+            self.text.set(f"{fmt_size(done)} so far")
+
+
 class App(tk.Tk):
     """The first window: what to do."""
 
@@ -1641,6 +1791,10 @@ class App(tk.Tk):
         # the window of a running conversion, so that its result can be acted on
         # and the window closed; None when none is running
         self._converter_win = None
+        # what is known about a new version, and the window that says it is
+        # being fetched
+        self._update_queue: queue.Queue = queue.Queue()
+        self._update_win: Optional[UpdateWindow] = None
 
         head = ttk.Frame(self, padding=(24, 22, 24, 6))
         head.pack(fill=tk.X)
@@ -1678,6 +1832,169 @@ class App(tk.Tk):
             # a portable program in a folder it may not write to cannot work;
             # this is the one thing to say before the user types anything
             self.after(200, self._no_write_rights)
+        self._start_update_check()
+
+    # ---------- a new version ----------
+
+    def _start_update_check(self):
+        """
+        Asks, once, whether there is a version above the one running.
+
+        The question is asked in a thread and answered here, in the thread of
+        the window: a window that waits for a network is a window that looks
+        broken.
+
+        It is not asked at all when there is no exe to replace - that is, when
+        the program is run from sources. Somebody working on the code has the
+        code, not a build of it, and an archive of a binary written over their
+        sources would be worse than no update at all.
+        """
+        if launcher_exe() is None:
+            return
+        # the temporary copy of the program that the last update ran from: the
+        # copy holds the exe the updater was running from, and the updater could
+        # not delete it, so this program does it now
+        threading.Thread(target=self._clean_update_copies, daemon=True).start()
+        threading.Thread(target=self._look_for_update, daemon=True).start()
+        self.after(300, self._poll_update)
+
+    @staticmethod
+    def _clean_update_copies():
+        """
+        Removes what the last update left behind, a moment after the program
+        starts - the updater is still leaving when the program it put in place
+        begins, and a copy that is still held cannot be deleted.
+        """
+        for attempt in range(6):
+            time.sleep(2 if attempt else 1)
+            try:
+                update_clean_update_folders()
+            except Exception:                       # noqa: BLE001 - not shown
+                return
+
+    def _look_for_update(self):
+        """
+        The question, asked in a thread.
+
+        Nothing is shown if there is no new version, and nothing is shown if the
+        question cannot be answered: a program that complains about the network
+        every time it is started is a program nobody starts.
+        """
+        try:
+            tag = latest_tag()
+        except Exception:                           # noqa: BLE001 - not shown
+            return
+        if tag and is_newer(tag):
+            self._update_queue.put(("newer", tag))
+
+    def _poll_update(self):
+        """
+        Takes what the thread has found and acts on it, in this thread.
+
+        The whole queue is taken, not one thing from it: a download of sixty
+        megabytes sends a message about every chunk it has read, and taking one
+        of them per tick would let the queue grow faster than it is emptied and
+        put the news that the download is over behind hundreds of lines about
+        how far along it is.
+        """
+        while True:
+            try:
+                kind, payload = self._update_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "newer":
+                self._offer_update(payload)
+            elif kind == "progress":
+                if self._update_win is not None:
+                    self._update_win.progress(*payload)
+            elif kind == "downloaded":
+                self._put_update_in_place(payload)
+            elif kind == "failed":
+                self._update_failed(payload)
+        self.after(300, self._poll_update)
+
+    def _offer_update(self, tag):
+        """
+        The question, and the answer is forgotten if it is no.
+
+        Nothing is remembered about it: the next start of the program asks
+        again and asks again, which is what was asked for - a version that is
+        quietly ignored is a version that is never taken.
+        """
+        if not messagebox.askyesno(
+                "A new version has been released",
+                f"A new version of SampleScanner is out: {tag}.\n\n"
+                f"Update now?",
+                parent=self):
+            return
+        self._update_win = UpdateWindow(self, tag)
+        threading.Thread(target=self._fetch_update, args=(tag,),
+                         daemon=True).start()
+
+    def _fetch_update(self, tag):
+        """Fetches the archive of that version, saying how far it has got."""
+        try:
+            dest = os.path.join(tempfile.gettempdir(),
+                                f"SampleScanner-{tag}-update.zip")
+            # the progress is said a few times a second, not once per chunk: a
+            # bar that is redrawn a thousand times a second is not a bar, it is
+            # a queue of messages waiting to be taken
+            last = [0.0]
+
+            def report(done, total):
+                now = time.perf_counter()
+                if now - last[0] < 0.2 and total and done < total:
+                    return
+                last[0] = now
+                self._update_queue.put(("progress", (done, total)))
+
+            download(download_url(tag), dest, progress=report)
+        except Exception as exc:                     # noqa: BLE001 - shown
+            self._update_queue.put(("failed", str(exc)))
+            return
+        self._update_queue.put(("downloaded", (tag, dest)))
+
+    def _put_update_in_place(self, payload):
+        """
+        Hands the archive over to a second copy of the program and leaves.
+
+        A file that is running cannot be written over on Windows, but it can be
+        renamed, and a name that is free is a name the new file can be written
+        to - so the second copy moves each file it replaces aside and puts the
+        new one in its place. The files that were moved aside are removed at the
+        next start of the program, when nothing holds them.
+        """
+        _tag, zip_path = payload
+        if self._update_win is not None:
+            self._update_win.destroy()
+            self._update_win = None
+        exe = launcher_exe()
+        if exe is None:
+            # There is no exe to replace: the program is being run from
+            # sources, and an archive of a binary has no business being written
+            # over somebody's code. The check does not even start in that case;
+            # this is here so that it still cannot happen if that changes.
+            messagebox.showerror(
+                "This is not a build of the program",
+                "The program is running from sources, so there is nothing to "
+                "update. Download the portable build to get a new version.",
+                parent=self)
+            return
+        try:
+            spawn_updater(zip_path, program_dir(), exe, os.getpid())
+        except Exception as exc:                     # noqa: BLE001 - shown
+            messagebox.showerror("Could not start the update", str(exc),
+                                 parent=self)
+            return
+        self.destroy()
+
+    def _update_failed(self, message):
+        """The download did not make it: say so and carry on as before."""
+        if self._update_win is not None:
+            self._update_win.destroy()
+            self._update_win = None
+        messagebox.showerror("The update could not be downloaded", message,
+                             parent=self)
 
     def _no_write_rights(self):
         messagebox.showerror(

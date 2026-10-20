@@ -58,7 +58,7 @@ for _name in ("cache", "results"):
         shutil.move(_live, _parked)
         _KEEP.append((_parked, _live))
 
-# What travels with the exe: the short readme only. README_all.md is the
+# What travels with the exe: the readme, and only that. README_all.md is the
 # developer documentation and has no business in a user's folder; the window's
 # Help button falls back to looking for it next to the exe.
 datas = []
@@ -130,13 +130,13 @@ coll = COLLECT(
     name="SampleScanner",
 )
 
-# Beside the exe: the short readme under the name users look for, the version
+# Beside the exe: the readme under the name users look for, the version
 # the build carries — written from ssc/version.py, the single place it is kept,
 # never typed here — and the two empty folders the program writes into; an empty
 # folder survives a zip as a folder entry, so the archive shows what is where
 # before the first run.
 _out = _OUT          # the same folder the build was just written into
-shutil.copyfile(os.path.join(SPECPATH, "README_dist.md"),
+shutil.copyfile(os.path.join(SPECPATH, "README.md"),
                 os.path.join(_out, "README.md"))
 with open(os.path.join(SPECPATH, "ssc", "version.py"), encoding="utf-8") as _f:
     _ns = {}
