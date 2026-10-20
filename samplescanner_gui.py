@@ -139,7 +139,8 @@ from ssc.config import DEFAULT_BATCH                                      # noqa
 from ssc.format import exe_name, fmt_elapsed, fmt_size
 from ssc.launcher import (converter_argv, launcher_argv,         # noqa: E402
                           launcher_dir, launcher_exe)
-from ssc.update import (clean_update_folders as update_clean_update_folders,  # noqa: E402
+from ssc.update import (clean_update_archives as update_clean_update_archives,  # noqa: E402
+                         clean_update_folders as update_clean_update_folders,  # noqa: E402
                          download, download_url, is_newer, latest_tag,
                          spawn_updater)
 from ssc.pitch import (count_pitches, describe_pitch_order,          # noqa: E402
@@ -1873,6 +1874,7 @@ class App(tk.Tk):
             time.sleep(2 if attempt else 1)
             try:
                 update_clean_update_folders()
+                update_clean_update_archives()
             except Exception:                       # noqa: BLE001 - not shown
                 return
 
@@ -1938,8 +1940,11 @@ class App(tk.Tk):
     def _fetch_update(self, tag):
         """Fetches the archive of that version, saying how far it has got."""
         try:
+            # The name carries the number of this process, so that two copies
+            # of the program updating at the same time do not fetch into the
+            # same file and delete each other's archive
             dest = os.path.join(tempfile.gettempdir(),
-                                f"SampleScanner-{tag}-update.zip")
+                                f"SampleScanner-{tag}-update-{os.getpid()}.zip")
             # the progress is said a few times a second, not once per chunk: a
             # bar that is redrawn a thousand times a second is not a bar, it is
             # a queue of messages waiting to be taken
@@ -2132,7 +2137,45 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _remove_update_copy():
+    """
+    Removes the temporary copy of the program that the update ran from.
+
+    The copy is made in the temporary folder of the system, and the program
+    that is put in place is told where it is through the environment. Nobody
+    else can delete it: the copy holds the exe the updater is running from, and
+    a file that is being run cannot be removed.
+
+    So it is this program that does it, now, at its start - a hundred and
+    seventy megabytes that would otherwise stay in the temporary folder of the
+    system for ever.
+
+    The path is only used when it is a copy of THIS program: the name of a
+    temporary folder is not a secret, the temporary folder belongs to the
+    system, and a folder of ours that merely has a similar name is not ours.
+    """
+    path = os.environ.get("SAMPLESCANNER_UPDATE_TEMP") or ""
+    if not path:
+        return
+    folder = os.path.basename(path.rstrip("\\/"))
+    if not folder.startswith("sssc-update-"):
+        return                              # not ours: leave it alone
+    if not os.path.isdir(path):
+        return
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return
+    if not any(name.lower().endswith(".exe") for name in names):
+        return                              # not a copy of the program
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        return                              # held: an update is going on
+
+
 def main():
+    _remove_update_copy()
     app = App()
     app.mainloop()
 

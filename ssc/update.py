@@ -50,6 +50,11 @@ KEEP_DIRS = ("cache", "results")
 # place where the temporary copy of itself is, so that it can remove it.
 UPDATE_TEMP_ENV = "SAMPLESCANNER_UPDATE_TEMP"
 
+# The mark inside a temporary copy of the program. Without it the cleanup would
+# remove any folder in the temporary directory whose name begins like one of
+# ours - and the temporary directory belongs to the system, not to us.
+COPY_MARK = ".samplescanner-update-copy"
+
 # The folder inside the archive that holds the program, and the name of the
 # archive itself, which carries the version it belongs to.
 ARCHIVE_DIR = "SampleScanner"
@@ -278,6 +283,29 @@ def _wait_until_replaceable(path: str, timeout: float = 120.0) -> bool:
             time.sleep(0.3)
 
 
+def _copy_folder(base: str, pid: int) -> str:
+    """
+    A free folder in the temporary directory for the copy of the program.
+
+    The name carries the number of the process that is making the copy, so that
+    two updates never share one. If a folder of that name is there already and
+    it is not ours - it has no mark in it - then it belongs to somebody else
+    and is left alone, and a number is added to the name until a free one is
+    found.
+    """
+    name = f"sssc-update-{pid}"
+    path = os.path.join(base, name)
+    counter = 0
+    while os.path.exists(path):
+        if os.path.isfile(os.path.join(path, COPY_MARK)):
+            shutil.rmtree(path, ignore_errors=True)   # ours, left over
+            break
+        counter += 1
+        name = f"sssc-update-{pid}-{counter}"
+        path = os.path.join(base, name)
+    return path
+
+
 def copy_for_update(target: str) -> str:
     """
     A copy of the program, to run the update from.
@@ -298,9 +326,13 @@ def copy_for_update(target: str) -> str:
     # The copy is made in the temporary folder of the system and NOT in the
     # folder of the program: a folder cannot be copied into itself.
     base = tempfile.gettempdir()
-    temp = os.path.join(base, f"sssc-update-{os.getpid()}")
-    shutil.rmtree(temp, ignore_errors=True)
+    temp = _copy_folder(base, os.getpid())
     os.makedirs(temp, exist_ok=True)
+    # A mark inside the copy, so that only a copy of THIS program is ever
+    # removed by the cleanup: a folder in the temporary directory that happens
+    # to have a similar name is somebody else's and is left alone.
+    with open(os.path.join(temp, COPY_MARK), "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
     for name in os.listdir(target):
         if name in KEEP_DIRS:
             continue
@@ -314,6 +346,28 @@ def copy_for_update(target: str) -> str:
         except OSError as exc:
             raise RuntimeError(f"the program could not be copied: {exc}")
     return temp
+
+
+def _is_our_copy(path: str) -> bool:
+    """
+    Whether a folder in the temporary directory is a copy of this program.
+
+    The copy carries a mark inside it, put there when it was made. A copy made
+    by an OLDER version of the program carries no mark - it did not know about
+    marks - and it still has to be recognised, or the update from that version
+    would leave a hundred and seventy megabytes in the temporary folder for
+    ever. A folder that holds the program itself is taken for such a copy.
+
+    A folder that is neither is somebody else's and is left alone: the
+    temporary directory belongs to the system, not to us.
+    """
+    if os.path.isfile(os.path.join(path, COPY_MARK)):
+        return True
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return any(name.lower().endswith(".exe") for name in names)
 
 
 def clean_update_folders(base: Optional[str] = None) -> int:
@@ -330,6 +384,9 @@ def clean_update_folders(base: Optional[str] = None) -> int:
     the update runs. Removing it then would delete the copy out from under the
     update that is filling it - which is exactly what happened before this was
     looked at.
+
+    A folder that is not a copy of this program is left alone as well: the
+    temporary directory of the system is shared with everything else on it.
     """
     base = base or tempfile.gettempdir()
     removed = 0
@@ -343,9 +400,11 @@ def clean_update_folders(base: Optional[str] = None) -> int:
         path = os.path.join(base, name)
         if not os.path.isdir(path):
             continue
-        pid = name[len("sssc-update-"):]
+        pid = name[len("sssc-update-"):].split("-")[0]
         if pid.isdigit() and _process_alive(int(pid)):
             continue                    # an update is going on right now
+        if not _is_our_copy(path):
+            continue                    # not ours: somebody else's folder
         try:
             shutil.rmtree(path)
             removed += 1
@@ -371,6 +430,48 @@ def _process_alive(pid: int) -> bool:
         return code.value == 259         # STILL_ACTIVE
     except Exception:
         return False
+
+
+def clean_update_archives(base: Optional[str] = None) -> int:
+    """
+    Removes the archives of updates that did not finish.
+
+    A download that was interrupted - the network went, the program was closed
+    - leaves its half-read archive behind, and an archive of a release is sixty
+    megabytes. The normal ending is that the copy of the program that does the
+    writing removes it as soon as it has unpacked it, but that copy only gets
+    there if the download was whole.
+
+    Only files that are clearly ours are touched: the name says what they are,
+    and the number of the process that fetched them says whether that process
+    is still at work on them.
+
+    An archive that cannot be removed is one that somebody is holding open, and
+    a download into it is going on right now; it is left alone and looked at
+    again at the next start.
+    """
+    base = base or tempfile.gettempdir()
+    removed = 0
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("SampleScanner-") or not name.endswith(".zip"):
+            continue
+        if "-update" not in name:
+            continue
+        stem = name[:-len(".zip")]
+        pid_text = stem.rsplit("-", 1)[-1]
+        path = os.path.join(base, name)
+        if pid_text.isdigit() and _process_alive(int(pid_text)):
+            continue                # a download is going on right now
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            continue                # held: a download is going on
+    return removed
 
 
 def _same_file(one: str, two: str) -> bool:
@@ -531,6 +632,15 @@ def apply_update_main(argv: Sequence[str]) -> int:
     except Exception as exc:                         # noqa: BLE001 - reported
         print(f"update failed: {exc}")
         return 1
+    finally:
+        # The archive has been read and unpacked, and it is sixty megabytes of
+        # somebody's disk. It was a temporary file and it goes back to being one:
+        # a portable program that leaves a copy of itself in the temporary
+        # folder of the system for ever is not portable.
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
     print(f"updated to {version}")
     return 0
 
